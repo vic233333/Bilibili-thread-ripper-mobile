@@ -31,8 +31,30 @@
     return { hosts: {} };
   }
 
+  function touchedAt(record) {
+    return Math.max(record.okAt || 0, record.failAt || 0, record.measuredAt || 0, record.segAt || 0);
+  }
+
+  // 保存时先跟存储里现在的那份合并，按节点取较新的记录。每次请求都是一次独立的脚本运行，
+  // 开头读、结尾写；画面和音轨、前后两段经常同时在跑，直接覆盖就是「谁最后写完谁说了算」——
+  // 一次拖了几秒的慢运行结束时，会把它开头读到的那份旧记忆整个盖回去，中间别的运行学到的
+  // 全部作废。按节点合并后，一次重叠最多丢一个节点的一笔观测。
   function saveHealth(health) {
     const now = Date.now();
+    const stored = loadHealth();
+    Object.keys(stored.hosts).forEach(function (host) {
+      const mine = health.hosts[host];
+      const theirs = stored.hosts[host];
+      if (!mine || touchedAt(theirs) > touchedAt(mine)) health.hosts[host] = theirs;
+    });
+    ["leader", "leaderAt", "trialAt", "pushback"].forEach(function (key) {
+      if (stored[key] === undefined) return;
+      const newer = key === "pushback"
+        ? (Number(stored.pushback && stored.pushback.until) || 0) > (Number(health.pushback && health.pushback.until) || 0)
+        : key === "leaderAt" || key === "trialAt" ? (Number(stored[key]) || 0) > (Number(health[key]) || 0)
+        : (Number(stored.leaderAt) || 0) > (Number(health.leaderAt) || 0);
+      if (newer) health[key] = stored[key];
+    });
     Object.keys(health.hosts).forEach(function (host) {
       const record = health.hosts[host];
       const touched = Math.max(record.okAt || 0, record.failAt || 0);
@@ -122,7 +144,13 @@
     const record = health.hosts[host];
     if (!record) return 0;
     const fresh = record.segAt && Date.now() - record.segAt < SEGMENT_TTL_MS;
-    const base = fresh ? (record.segBps || 0) : (record.bps || 0) * PIECE_DISCOUNT;
+    const pieceScore = (record.bps || 0) * PIECE_DISCOUNT;
+    let base = fresh ? (record.segBps || 0) : pieceScore;
+    // 整段成绩还「新鲜」但比之后的单块测量更旧时，允许新证据把分往上抬：一个节点在链路抽风
+    // 时领跑过一段，整段成绩就烂了两分钟；它下了领跑位之后只有试探块和副本还在测它，
+    // 这些单块要是又快起来了，不该被那笔旧账压着回不来。往下压的方向不需要这条，
+    // 悲观采样已经管着。
+    if (fresh && (record.measuredAt || 0) > record.segAt && pieceScore > base) base = pieceScore;
     return base * (host && host === originalHost ? ORIGINAL_BONUS : 1);
   }
 
@@ -169,7 +197,13 @@
     return incumbent;
   }
 
-  function markFailure(health, host, error, bytes, elapsedMs) {
+  // App 自己那个节点最多退避这么久。0.7.0 的日志里它在一场抽风里连着失败四次，按 3、6、12、
+  // 24、48 秒的阶梯被关了 48 秒，这一分钟里领跑位落在一个慢五到十倍的节点上，两段因此拖过了
+  // 播放器的耐心。它是 App 自己一直在用的节点，App 的直连请求根本不理会我们的退避，所以对它
+  // 只做短退避：抽风一过就回来。
+  const ORIGINAL_BLOCK_MAX_MS = 6 * 1000;
+
+  function markFailure(health, host, error, bytes, elapsedMs, originalHost) {
     const record = recordOf(health, host);
     const now = Date.now();
     // 超时、断连同样是「慢」的证据。以前这里只记退避不动分数，于是一个卡死的节点带着
@@ -177,7 +211,8 @@
     markSlow(health, host, bytes, elapsedMs);
     record.fails = (record.fails || 0) + 1;
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
-    record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
+    const cap = originalHost && host === originalHost ? ORIGINAL_BLOCK_MAX_MS : 60 * 1000;
+    record.blockedUntil = now + Math.min(cap, 3000 * Math.pow(2, Math.min(record.fails, 4)));
     const status = Number(error && error.status) || 0;
     if (PUSHBACK_STATUSES.indexOf(status) >= 0) health.pushback = { until: now + PUSHBACK_REST_MS, status, host };
     else if (status >= 400 && status < 500 && status !== 408) record.blockedUntil = now + REFUSED_BLOCK_MS;
@@ -253,8 +288,14 @@
     }
     const leader = chooseLeader(pool, health, originalHost);
     for (let index = 0; index < count; index += 1) assignment.push(leader);
-    // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
     const now = Date.now();
+    // 领跑位不在 App 自己的节点上时，每段都留最后一块去试它：它是我们最想回去的节点，
+    // 不试就只有过期的坏成绩，永远回不去。退避中的不试。
+    if (count >= 4 && originalHost && leader !== originalHost && pool.indexOf(originalHost) >= 0 && !isBlocked(health.hosts[originalHost], now)) {
+      assignment[count - 1] = originalHost;
+      return assignment;
+    }
+    // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
     // 「没测过」要包含「测过但已经过期」，否则热身之后这个分支永远不会触发，节点记忆就停在开头那一轮。
     const untried = ranked.filter(function (entry) {
       return entry.bps <= 0 || !isMeasured(health.hosts[entry.host], now);
@@ -293,6 +334,9 @@
 
   // 一块该多久传完：按已测到的最快节点估，超过它的 1.5 倍还没回来就再向另一个节点要一份
   // 副本，先到先用。上游叫这个 hedge。没有测速数据时用固定值。
+  // 副本最迟这时开：单段的预算只有约 1.9 秒，副本再晚就没有时间跑完了。
+  const HEDGE_MAX_MS = 1000;
+
   function hedgeDelayMs(plan, piece) {
     const host = plan.assignment[piece.index] || "";
     const record = host ? plan.health.hosts[host] : null;
@@ -309,8 +353,11 @@
     }
     // 试探用的那块：最多让它拖半秒，之后就让领跑者也下一份。
     if (piece.trial) return estimate ? Math.max(300, Math.min(700, estimate)) : 600;
-    return estimate ? Math.max(400, Math.min(1500, estimate)) : 1200;
+    return estimate ? Math.max(400, Math.min(HEDGE_MAX_MS, estimate)) : 1000;
   }
+
+  // 剩这么点时间连最快的节点也跑不完一块，就不再发新请求。
+  const MIN_LAUNCH_MS = 250;
 
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
   // $httpClient 没法取消，输掉的副本会在后台跑完，它的结果只用来更新节点速度。
@@ -362,8 +409,9 @@
         // 别的块已经宣告失败、整段要交回原连接时，这块也不用再换节点试了。
         if (plan.aborted) { finish(false, lastError || env.makeError("Aborted", "整段下载已放弃")); return; }
         const now = Date.now();
-        const remainingSec = (plan.deadlineAt - now) / 1000;
-        if (remainingSec < 1) { giveUp(lastError || env.makeError("Deadline", "这次请求的总时限已到")); return; }
+        const remainingMs = plan.deadlineAt - now;
+        if (remainingMs < MIN_LAUNCH_MS) { giveUp(lastError || env.makeError("Deadline", "这次请求的总时限已到")); return; }
+        const remainingSec = remainingMs / 1000;
         // 整段的重试预算：平均每块三次。所有节点都拒绝同一个地址时，不必让每块把每个节点都
         // 试两遍，早点交回原连接。
         if (plan.attempts >= plan.attemptBudget) {
@@ -401,7 +449,7 @@
             finish(false, error || env.makeError("ScriptError", "未知错误"));
             return;
           }
-          markFailure(plan.health, host, error, piece.length, waitedMs);
+          markFailure(plan.health, host, error, piece.length, waitedMs, plan.originalHost);
           env.log("debug", "子块 " + piece.index + " 在 " + host + " 失败", error);
           lastError = error;
           if (!settled) launch(false);
@@ -446,7 +494,7 @@
       all: ordered.all,
       originalHost: context.parts.host,
       assignment: assignPieces(ordered.pool, context.health, pieces.length, context.parts.host),
-      deadlineAt: startedAt + settings.deadlineSec * 1000,
+      deadlineAt: startedAt + settings.deadlineMs,
       usage: {},
       attempts: 0,
       hedges: 0,
@@ -465,12 +513,28 @@
     const tally = {};
     plan.assignment.forEach(function (host) { tally[host.split(".")[0]] = (tally[host.split(".")[0]] || 0) + 1; });
     env.log("debug", "拆成 " + pieces.length + " 块，分配", tally);
+    // 到点就交回，不管还有几块在途。播放器（真机三份日志、三个版本一致）从发出请求算起
+    // 大约只等 2.45 秒：在此之前交出去的每一段都被用了，在此之后交出去的每一段都被丢掉，
+    // 然后它隔几秒再把同一段要一遍。所以拖过时限再拼好毫无价值，只会占着连接、
+    // 把抽风时的坏样本继续写进节点记忆。直连是流式的，它的第一个字节几十到几百毫秒就到，
+    // 在 1.9 秒交回原连接还赶得上播放器的耐心。
+    let handover = null;
+    const guard = new Promise(function (_resolve, reject) {
+      if (!env.api.setTimeout) return;
+      handover = env.api.setTimeout(function () {
+        handover = null;
+        plan.aborted = true;
+        reject(env.makeError("Deadline", "这次请求的总时限已到，交回原连接"));
+      }, Math.max(0, plan.deadlineAt - Date.now()));
+    });
     let results;
     try {
-      results = await Promise.all(pieces.map(function (piece) { return downloadPiece(piece, plan); }));
+      results = await Promise.race([Promise.all(pieces.map(function (piece) { return downloadPiece(piece, plan); })), guard]);
     } catch (error) {
       plan.aborted = true;
       throw error;
+    } finally {
+      if (handover !== null && env.api.clearTimeout) env.api.clearTimeout(handover);
     }
     let total = null;
     results.forEach(function (result) {
@@ -499,6 +563,7 @@
       usage: plan.usage,
       attempts: plan.attempts,
       hedges: plan.hedges,
+      leader: plan.assignment[0] || "",
       pieceMsMin: plan.pieceMs.length ? Math.min.apply(null, plan.pieceMs) : 0,
       pieceMsMax: plan.pieceMs.length ? Math.max.apply(null, plan.pieceMs) : 0,
       elapsedMs

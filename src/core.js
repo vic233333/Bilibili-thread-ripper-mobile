@@ -162,10 +162,11 @@
       // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
       overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 2, 30, 4)),
-      // 曾经按「App 三秒就重发」把这里压到 3 秒，真机上直接翻车：环境自己的连接超时就要两秒，
-      // 一次失败之后预算只剩不到一秒，连换个节点重试的机会都没有，于是整段直接放弃。
-      // 0.6.0 的失败率因此从 3% 涨到 44%。预算要够试三四次。
-      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 8)),
+      // 单段的总时限（毫秒）：到点不管还有几块在途，一律交回原连接。真机三份日志、三个版本
+      // 得到同一条线：播放器从发出请求算起大约只等 2.45 秒，之前交出去的都被用了，之后交出去的
+      // 都被丢掉、隔几秒再要一遍。所以拖过这条线毫无价值。直连是流式的，第一个字节几十到几百
+      // 毫秒就到，1.9 秒交回还赶得上。这条线会不会随网络变，设置页的「播放器的耐心」在持续量。
+      deadlineMs: Math.round(clamp(source.deadlineMs, 800, 40000, 1900) / 100) * 100,
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },

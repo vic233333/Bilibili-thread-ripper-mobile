@@ -94,6 +94,10 @@
     // （多出来的那截不能越过文件末尾）、最近几次的实测速度撑得住、不在限流中。
     const target = overfetchTarget(parts, range, settings, health, entry);
     const inflightKey = parts.path + "#" + range.start + "-" + range.end;
+    // 这段是不是我们刚交出去过的：是的话，上次那份被播放器丢了。这是量「播放器耐心」的唯一办法。
+    const redo = settingsModule.noteRedo(parts.path, range);
+    if (redo.redoMs) entry.redo = redo.redoMs;
+    if (redo.usedMs.length) entry.usedMs = redo.usedMs;
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
     const runId = String(startedAtOf(entry)) + Math.random().toString(36).slice(2, 7);
@@ -115,6 +119,7 @@
       settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.threads = download.pieces;
+      entry.leader = download.leader;
       entry.hosts = download.usage;
       entry.attempts = download.attempts;
       entry.hedges = download.hedges;
@@ -132,6 +137,8 @@
         "Cache-Control": "no-store",
         "X-BTR": BTR.VERSION + "; pieces=" + download.pieces + "; hosts=" + Object.keys(download.usage).length + "; ms=" + download.elapsedMs
       };
+      // 记的是从请求进来到交出去的全程，播放器的耐心量的就是这个。
+      settingsModule.rememberDelivered(parts.path, target, Date.now() - startedAtOf(entry));
       return { result: "accelerated", reason: "ok", done: { response: { status: 206, headers: responseHeaders, body: download.bytes } } };
     } catch (error) {
       settingsModule.releaseBusy(runId);
@@ -208,10 +215,15 @@
       env.log("error", "统计保存失败", error);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
+    // 节点名只留能认出来的那一截：upos-sz-mirrorali.bilivideo.com → mirrorali。
+    const shortHost = function (host) {
+      return String(host || "").replace(/^upos-[a-z]{2}-/, "").replace(/\.(bilivideo\.(com|cn|net)|akamaized\.net|szbdyd\.com)(:\d+)?$/, "");
+    };
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "") + (entry.overfetch ? " 多给 " + Math.round(entry.overfetch / 1024) + "KiB" : "")
-      : entry.rewrittenTo || entry.error || "";
-    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
+      ? "领跑 " + shortHost(entry.leader) + " 原 " + shortHost(parts.host) + " " + JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "") + (entry.overfetch ? " 多给 " + Math.round(entry.overfetch / 1024) + "KiB" : "")
+      : (entry.rewrittenTo ? "→ " + shortHost(entry.rewrittenTo) + " " : "") + (entry.error || "") + (entry.kind !== "unknown" ? " 原 " + shortHost(parts.host) : "");
+    const redoNote = entry.redo ? "（" + entry.redo + "ms 前交出的那份被丢了）" : "";
+    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms" + redoNote, detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }
     catch (error) { env.log("error", "日志保存失败", error); }
     env.finish(outcome.done);

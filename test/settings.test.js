@@ -26,13 +26,13 @@ test("设置页能打开，显示版本和默认设置", async () => {
 
 test("保存表单后设置写进存储，页面回显新值", async () => {
   const env = createEnv({ server: null });
-  const query = "enabled=1&mode=custom&customHosts=upos-sz-mirrorcos.bilivideo.com%0Aupos-sz-mirrorali.bilivideo.com%2C+bad+host&threads=4&maxMiB=12&minChunkKiB=512&subrequestScheme=https&attemptTimeoutSec=6&deadlineSec=25&debug=1";
+  const query = "enabled=1&mode=custom&customHosts=upos-sz-mirrorcos.bilivideo.com%0Aupos-sz-mirrorali.bilivideo.com%2C+bad+host&threads=4&maxMiB=12&minChunkKiB=512&subrequestScheme=https&attemptTimeoutSec=6&deadlineMs=2500&debug=1";
   const { value } = await env.run(page(`/save?${query}`));
   assert.equal(value.response.status, 302, "保存完要跳回设置页，留在 /save 上刷新会再存一次");
   assert.equal(value.response.headers.Location, "http://btr.settings/?done=saved");
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
-    revision: 6,
+    revision: 7,
     enabled: true,
     accelerate: "split",
     mode: "custom",
@@ -44,7 +44,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
     swapSingle: false,
     subrequestScheme: "https",
     attemptTimeoutSec: 6,
-    deadlineSec: 25,
+    deadlineMs: 2500,
     debug: true
   });
   const back = (await env.run(page("/?done=saved"))).value.response.body;
@@ -55,7 +55,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
 
 test("越界的值会被拉回范围，缺失的复选框当作关闭", async () => {
   const env = createEnv({ server: null });
-  await env.run(page("/save?mode=nonsense&threads=999&maxMiB=999&minChunkKiB=1&attemptTimeoutSec=0&deadlineSec=1000"));
+  await env.run(page("/save?mode=nonsense&threads=999&maxMiB=999&minChunkKiB=1&attemptTimeoutSec=0&deadlineMs=1000000"));
   const saved = env.store.json("btr.settings");
   assert.equal(saved.enabled, false);
   assert.equal(saved.mode, "auto");
@@ -63,7 +63,7 @@ test("越界的值会被拉回范围，缺失的复选框当作关闭", async ()
   assert.equal(saved.maxMiB, 24);
   assert.equal(saved.minChunkKiB, 64);
   assert.equal(saved.attemptTimeoutSec, 2);
-  assert.equal(saved.deadlineSec, 40);
+  assert.equal(saved.deadlineMs, 40000);
   assert.equal(saved.swapSingle, false);
 });
 
@@ -118,7 +118,7 @@ test("全部重置把设置也恢复成默认值", async () => {
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=all"));
   assert.equal(value.response.status, 302);
-  assert.deepEqual(store.json("btr.settings"), { revision: 6 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 7 });
   assert.deepEqual(store.json("btr.busy"), {});
   assert.deepEqual(store.json("btr.lastMedia"), {});
   const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
@@ -137,7 +137,7 @@ test("恢复默认设置只动设置，统计和节点记忆留着", async () =>
   const { value } = await env.run(page("/reset?what=settings"));
   assert.equal(value.response.status, 302);
   assert.ok((await env.run(page("/?done=reset&what=settings"))).value.response.body.includes("恢复默认"));
-  assert.deepEqual(store.json("btr.settings"), { revision: 6 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 7 });
   assert.equal(store.json("btr.stats").seen, 9);
   assert.ok(store.json("btr.health").hosts["upos-sz-mirrorali.bilivideo.com"]);
 });
@@ -146,13 +146,19 @@ test("第 4 版保存的旧时限让位给新默认值，用户自己改过的�
   const stale = createStore();
   stale.setJson("btr.settings", { revision: 4, deadlineSec: 10, attemptTimeoutSec: 6 });
   let diag = JSON.parse((await createEnv({ server: null, store: stale }).run(page("/diag.json"))).value.response.body);
-  assert.equal(diag.settings.deadlineSec, 8, "10 秒是第 4 版的默认值，不是用户的选择");
+  assert.equal(diag.settings.deadlineMs, 1900, "10 秒是第 4 版的默认值，不是用户的选择");
+  assert.equal(diag.settings.deadlineSec, undefined, "第 7 版起总时限按毫秒计");
   assert.equal(diag.settings.attemptTimeoutSec, 4);
   const chosen = createStore();
   chosen.setJson("btr.settings", { revision: 4, deadlineSec: 25, attemptTimeoutSec: 8 });
   diag = JSON.parse((await createEnv({ server: null, store: chosen }).run(page("/diag.json"))).value.response.body);
-  assert.equal(diag.settings.deadlineSec, 25, "自己改过的值要保留");
+  assert.equal(diag.settings.deadlineMs, 25000, "自己改过的值要保留，换算成毫秒");
   assert.equal(diag.settings.attemptTimeoutSec, 8);
+  // 第 6 版的默认 8 秒同样让位。
+  const six = createStore();
+  six.setJson("btr.settings", { revision: 6, deadlineSec: 8 });
+  diag = JSON.parse((await createEnv({ server: null, store: six }).run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.deadlineMs, 1900);
 });
 
 test("诊断 JSON 包含版本、能力、设置和统计", async () => {
@@ -767,7 +773,7 @@ test("副本等待时间按这块派给的那个节点自己的块耗时来估",
   const piece = { index: 0, length: 174763 };
   assert.equal(hedgeDelayMs(plan, piece), 400, "快节点：按它自己的 90 毫秒估，落到 400 毫秒下限");
   const other = hedgeDelayMs(plan, { index: 1, length: 174763 });
-  assert.ok(other > 1000 && other <= 1500, "慢节点：等久一点，但封顶，否则副本永远开不出来 " + other);
+  assert.ok(other > 800 && other <= 1000, "慢节点：等久一点，但封顶在 1 秒，否则副本在 1.9 秒的时限里跑不完 " + other);
   // 试探块单独一档，最多拖半秒多一点。
   const trial = hedgeDelayMs(plan, { index: 1, length: 174763, trial: true });
   assert.ok(trial >= 300 && trial <= 700, "试探块 " + trial);
@@ -809,4 +815,100 @@ test("模块和配置文件里的脚本地址都带当前版本号，匹配规�
     if (file.includes("https")) assert.ok(/^\[MITM\]/m.test(text) && /hostname = .*akamaized\.net/.test(text), file);
     else assert.ok(!/hostname = /.test(text), file);
   }
+});
+
+test("过期的整段成绩压不住更新的单块证据：下了领跑位的节点能靠试探块回来", async () => {
+  const BTR = await loadModules();
+  const { hostScore, markSegment, markSuccess } = BTR.accelerator;
+  const health = { hosts: {} };
+  // 抽风时领跑过一段：整段成绩只有 130 KB/s，两分钟内都算「新鲜」。
+  markSegment(health, "akam.akamaized.net", 1048576, 8000);
+  const stale = hostScore(health, "akam.akamaized.net", "");
+  assert.ok(stale < 2e5);
+  // 之后一块试探块 170 KiB 只用了 50 毫秒：新证据要能把分抬上去（单块打对折）。
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  markSuccess(health, "akam.akamaized.net", 174763, 50);
+  const lifted = hostScore(health, "akam.akamaized.net", "");
+  assert.ok(lifted > 1e6, "更新的快样本应当抬分 " + lifted);
+  assert.ok(Math.abs(lifted - health.hosts["akam.akamaized.net"].bps * 0.5) < 1, "抬到单块速度的一半");
+  // 反方向不走这条：整段成绩好、之后单块慢，仍按整段成绩（悲观采样另有一套往下压）。
+  const good = { hosts: {} };
+  markSegment(good, "a.bilivideo.com", 1048576, 100);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  markSuccess(good, "a.bilivideo.com", 174763, 3000);
+  assert.equal(hostScore(good, "a.bilivideo.com", ""), good.hosts["a.bilivideo.com"].segBps);
+});
+
+test("App 自己的节点最多退避 6 秒，别的节点照旧翻倍到 48 秒", async () => {
+  const BTR = await loadModules();
+  const { markFailure } = BTR.accelerator;
+  const health = { hosts: {} };
+  const error = { name: "NetworkError" };
+  for (let round = 0; round < 5; round += 1) {
+    markFailure(health, "akam.akamaized.net", error, 174763, 2000, "akam.akamaized.net");
+    markFailure(health, "other.bilivideo.com", error, 174763, 2000, "akam.akamaized.net");
+  }
+  const now = Date.now();
+  assert.ok(health.hosts["akam.akamaized.net"].blockedUntil - now <= 6000, "App 的节点连败五次也只关 6 秒");
+  assert.ok(health.hosts["other.bilivideo.com"].blockedUntil - now > 40000, "别的节点连败五次关 48 秒");
+  // 4xx 拒绝不受这条影响，照旧五分钟。
+  markFailure(health, "akam.akamaized.net", { name: "BadRange", status: 403 }, 0, 0, "akam.akamaized.net");
+  assert.ok(health.hosts["akam.akamaized.net"].blockedUntil - now > 4 * 60 * 1000);
+});
+
+test("领跑位不在 App 自己的节点上时，每段都留最后一块去试它", async () => {
+  const BTR = await loadModules();
+  const { assignPieces } = BTR.accelerator;
+  const now = Date.now();
+  const seg = (bps) => ({ segBps: bps, segAt: now, bps, measuredAt: now, okAt: now });
+  const pool = ["akam.akamaized.net", "ali.bilivideo.com", "cos.bilivideo.com"];
+  // App 的节点整段成绩很差、ali 快四倍以上：领跑位在 ali。
+  const health = { hosts: { "akam.akamaized.net": seg(1e6), "ali.bilivideo.com": seg(5e6), "cos.bilivideo.com": seg(2e6) } };
+  const first = assignPieces(pool, health, 6, "akam.akamaized.net");
+  assert.deepEqual(first.slice(0, 5), Array(5).fill("ali.bilivideo.com"));
+  assert.equal(first[5], "akam.akamaized.net", "最后一块试 App 自己的节点");
+  // 不受 45 秒间隔限制：紧接着的下一段照样试。
+  const second = assignPieces(pool, health, 6, "akam.akamaized.net");
+  assert.equal(second[5], "akam.akamaized.net");
+  // 它在退避中就不试。
+  health.hosts["akam.akamaized.net"].blockedUntil = now + 5000;
+  const third = assignPieces(pool, health, 6, "akam.akamaized.net");
+  assert.notEqual(third[5], "akam.akamaized.net");
+  // 领跑位就在它身上时，走原来的 45 秒试探逻辑。
+  const home = { hosts: { "akam.akamaized.net": seg(9e6), "ali.bilivideo.com": seg(5e6), "cos.bilivideo.com": seg(2e6) } };
+  assert.deepEqual(assignPieces(pool, home, 6, "akam.akamaized.net"), Array(6).fill("akam.akamaized.net"));
+});
+
+test("节点记忆保存时按节点合并，慢运行结束时盖不掉别的运行学到的东西", async () => {
+  const store = createStore();
+  const env = createEnv({ server: null, store });
+  const BTR = (await env.run(null)).exposed;
+  const { loadHealth, saveHealth, markSuccess } = BTR.accelerator;
+  // 运行 A 开头读到空记忆。
+  const a = loadHealth();
+  // 运行 B 在 A 还没结束时学到 ali 很快、akam 很慢，并先写回。
+  const b = loadHealth();
+  markSuccess(b, "ali.bilivideo.com", 1048576, 100);
+  markSuccess(b, "akam.akamaized.net", 174763, 3000);
+  b.leader = "ali.bilivideo.com";
+  b.leaderAt = Date.now();
+  saveHealth(b);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  // 运行 A 只学到 cos 的一笔，然后写回：ali、akam 和领跑者都得留着。
+  markSuccess(a, "cos.bilivideo.com", 1048576, 200);
+  saveHealth(a);
+  const merged = loadHealth();
+  assert.ok(merged.hosts["ali.bilivideo.com"].bps > 9e6, "B 学到的 ali 不能丢");
+  assert.ok(merged.hosts["akam.akamaized.net"].bps < 1e5, "B 学到的 akam 不能丢");
+  assert.ok(merged.hosts["cos.bilivideo.com"].bps > 4e6, "A 自己学到的 cos 要在");
+  assert.equal(merged.leader, "ali.bilivideo.com", "更新的领跑者记录胜出");
+  // 同一个节点两边都有：较新的那笔胜出。
+  const c = loadHealth();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  markSuccess(c, "ali.bilivideo.com", 174763, 5000);
+  saveHealth(c);
+  assert.ok(loadHealth().hosts["ali.bilivideo.com"].bps < 5e6, "更新的慢样本要写进去");
+  // 重置写的是空记忆，合并不该把旧记录带回来。
+  store.setJson("btr.health", { hosts: {} });
+  assert.deepEqual(loadHealth(), { hosts: {} });
 });

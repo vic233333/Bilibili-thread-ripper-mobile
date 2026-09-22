@@ -178,10 +178,11 @@ const BTR = { VERSION: "0.7.0" };
       // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
       overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 2, 30, 4)),
-      // 曾经按「App 三秒就重发」把这里压到 3 秒，真机上直接翻车：环境自己的连接超时就要两秒，
-      // 一次失败之后预算只剩不到一秒，连换个节点重试的机会都没有，于是整段直接放弃。
-      // 0.6.0 的失败率因此从 3% 涨到 44%。预算要够试三四次。
-      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 8)),
+      // 单段的总时限（毫秒）：到点不管还有几块在途，一律交回原连接。真机三份日志、三个版本
+      // 得到同一条线：播放器从发出请求算起大约只等 2.45 秒，之前交出去的都被用了，之后交出去的
+      // 都被丢掉、隔几秒再要一遍。所以拖过这条线毫无价值。直连是流式的，第一个字节几十到几百
+      // 毫秒就到，1.9 秒交回还赶得上。这条线会不会随网络变，设置页的「播放器的耐心」在持续量。
+      deadlineMs: Math.round(clamp(source.deadlineMs, 800, 40000, 1900) / 100) * 100,
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },
@@ -538,8 +539,30 @@ const BTR = { VERSION: "0.7.0" };
     return { hosts: {} };
   }
 
+  function touchedAt(record) {
+    return Math.max(record.okAt || 0, record.failAt || 0, record.measuredAt || 0, record.segAt || 0);
+  }
+
+  // 保存时先跟存储里现在的那份合并，按节点取较新的记录。每次请求都是一次独立的脚本运行，
+  // 开头读、结尾写；画面和音轨、前后两段经常同时在跑，直接覆盖就是「谁最后写完谁说了算」——
+  // 一次拖了几秒的慢运行结束时，会把它开头读到的那份旧记忆整个盖回去，中间别的运行学到的
+  // 全部作废。按节点合并后，一次重叠最多丢一个节点的一笔观测。
   function saveHealth(health) {
     const now = Date.now();
+    const stored = loadHealth();
+    Object.keys(stored.hosts).forEach(function (host) {
+      const mine = health.hosts[host];
+      const theirs = stored.hosts[host];
+      if (!mine || touchedAt(theirs) > touchedAt(mine)) health.hosts[host] = theirs;
+    });
+    ["leader", "leaderAt", "trialAt", "pushback"].forEach(function (key) {
+      if (stored[key] === undefined) return;
+      const newer = key === "pushback"
+        ? (Number(stored.pushback && stored.pushback.until) || 0) > (Number(health.pushback && health.pushback.until) || 0)
+        : key === "leaderAt" || key === "trialAt" ? (Number(stored[key]) || 0) > (Number(health[key]) || 0)
+        : (Number(stored.leaderAt) || 0) > (Number(health.leaderAt) || 0);
+      if (newer) health[key] = stored[key];
+    });
     Object.keys(health.hosts).forEach(function (host) {
       const record = health.hosts[host];
       const touched = Math.max(record.okAt || 0, record.failAt || 0);
@@ -629,7 +652,13 @@ const BTR = { VERSION: "0.7.0" };
     const record = health.hosts[host];
     if (!record) return 0;
     const fresh = record.segAt && Date.now() - record.segAt < SEGMENT_TTL_MS;
-    const base = fresh ? (record.segBps || 0) : (record.bps || 0) * PIECE_DISCOUNT;
+    const pieceScore = (record.bps || 0) * PIECE_DISCOUNT;
+    let base = fresh ? (record.segBps || 0) : pieceScore;
+    // 整段成绩还「新鲜」但比之后的单块测量更旧时，允许新证据把分往上抬：一个节点在链路抽风
+    // 时领跑过一段，整段成绩就烂了两分钟；它下了领跑位之后只有试探块和副本还在测它，
+    // 这些单块要是又快起来了，不该被那笔旧账压着回不来。往下压的方向不需要这条，
+    // 悲观采样已经管着。
+    if (fresh && (record.measuredAt || 0) > record.segAt && pieceScore > base) base = pieceScore;
     return base * (host && host === originalHost ? ORIGINAL_BONUS : 1);
   }
 
@@ -676,7 +705,13 @@ const BTR = { VERSION: "0.7.0" };
     return incumbent;
   }
 
-  function markFailure(health, host, error, bytes, elapsedMs) {
+  // App 自己那个节点最多退避这么久。0.7.0 的日志里它在一场抽风里连着失败四次，按 3、6、12、
+  // 24、48 秒的阶梯被关了 48 秒，这一分钟里领跑位落在一个慢五到十倍的节点上，两段因此拖过了
+  // 播放器的耐心。它是 App 自己一直在用的节点，App 的直连请求根本不理会我们的退避，所以对它
+  // 只做短退避：抽风一过就回来。
+  const ORIGINAL_BLOCK_MAX_MS = 6 * 1000;
+
+  function markFailure(health, host, error, bytes, elapsedMs, originalHost) {
     const record = recordOf(health, host);
     const now = Date.now();
     // 超时、断连同样是「慢」的证据。以前这里只记退避不动分数，于是一个卡死的节点带着
@@ -684,7 +719,8 @@ const BTR = { VERSION: "0.7.0" };
     markSlow(health, host, bytes, elapsedMs);
     record.fails = (record.fails || 0) + 1;
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
-    record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
+    const cap = originalHost && host === originalHost ? ORIGINAL_BLOCK_MAX_MS : 60 * 1000;
+    record.blockedUntil = now + Math.min(cap, 3000 * Math.pow(2, Math.min(record.fails, 4)));
     const status = Number(error && error.status) || 0;
     if (PUSHBACK_STATUSES.indexOf(status) >= 0) health.pushback = { until: now + PUSHBACK_REST_MS, status, host };
     else if (status >= 400 && status < 500 && status !== 408) record.blockedUntil = now + REFUSED_BLOCK_MS;
@@ -760,8 +796,14 @@ const BTR = { VERSION: "0.7.0" };
     }
     const leader = chooseLeader(pool, health, originalHost);
     for (let index = 0; index < count; index += 1) assignment.push(leader);
-    // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
     const now = Date.now();
+    // 领跑位不在 App 自己的节点上时，每段都留最后一块去试它：它是我们最想回去的节点，
+    // 不试就只有过期的坏成绩，永远回不去。退避中的不试。
+    if (count >= 4 && originalHost && leader !== originalHost && pool.indexOf(originalHost) >= 0 && !isBlocked(health.hosts[originalHost], now)) {
+      assignment[count - 1] = originalHost;
+      return assignment;
+    }
+    // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
     // 「没测过」要包含「测过但已经过期」，否则热身之后这个分支永远不会触发，节点记忆就停在开头那一轮。
     const untried = ranked.filter(function (entry) {
       return entry.bps <= 0 || !isMeasured(health.hosts[entry.host], now);
@@ -800,6 +842,9 @@ const BTR = { VERSION: "0.7.0" };
 
   // 一块该多久传完：按已测到的最快节点估，超过它的 1.5 倍还没回来就再向另一个节点要一份
   // 副本，先到先用。上游叫这个 hedge。没有测速数据时用固定值。
+  // 副本最迟这时开：单段的预算只有约 1.9 秒，副本再晚就没有时间跑完了。
+  const HEDGE_MAX_MS = 1000;
+
   function hedgeDelayMs(plan, piece) {
     const host = plan.assignment[piece.index] || "";
     const record = host ? plan.health.hosts[host] : null;
@@ -816,8 +861,11 @@ const BTR = { VERSION: "0.7.0" };
     }
     // 试探用的那块：最多让它拖半秒，之后就让领跑者也下一份。
     if (piece.trial) return estimate ? Math.max(300, Math.min(700, estimate)) : 600;
-    return estimate ? Math.max(400, Math.min(1500, estimate)) : 1200;
+    return estimate ? Math.max(400, Math.min(HEDGE_MAX_MS, estimate)) : 1000;
   }
+
+  // 剩这么点时间连最快的节点也跑不完一块，就不再发新请求。
+  const MIN_LAUNCH_MS = 250;
 
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
   // $httpClient 没法取消，输掉的副本会在后台跑完，它的结果只用来更新节点速度。
@@ -869,8 +917,9 @@ const BTR = { VERSION: "0.7.0" };
         // 别的块已经宣告失败、整段要交回原连接时，这块也不用再换节点试了。
         if (plan.aborted) { finish(false, lastError || env.makeError("Aborted", "整段下载已放弃")); return; }
         const now = Date.now();
-        const remainingSec = (plan.deadlineAt - now) / 1000;
-        if (remainingSec < 1) { giveUp(lastError || env.makeError("Deadline", "这次请求的总时限已到")); return; }
+        const remainingMs = plan.deadlineAt - now;
+        if (remainingMs < MIN_LAUNCH_MS) { giveUp(lastError || env.makeError("Deadline", "这次请求的总时限已到")); return; }
+        const remainingSec = remainingMs / 1000;
         // 整段的重试预算：平均每块三次。所有节点都拒绝同一个地址时，不必让每块把每个节点都
         // 试两遍，早点交回原连接。
         if (plan.attempts >= plan.attemptBudget) {
@@ -908,7 +957,7 @@ const BTR = { VERSION: "0.7.0" };
             finish(false, error || env.makeError("ScriptError", "未知错误"));
             return;
           }
-          markFailure(plan.health, host, error, piece.length, waitedMs);
+          markFailure(plan.health, host, error, piece.length, waitedMs, plan.originalHost);
           env.log("debug", "子块 " + piece.index + " 在 " + host + " 失败", error);
           lastError = error;
           if (!settled) launch(false);
@@ -953,7 +1002,7 @@ const BTR = { VERSION: "0.7.0" };
       all: ordered.all,
       originalHost: context.parts.host,
       assignment: assignPieces(ordered.pool, context.health, pieces.length, context.parts.host),
-      deadlineAt: startedAt + settings.deadlineSec * 1000,
+      deadlineAt: startedAt + settings.deadlineMs,
       usage: {},
       attempts: 0,
       hedges: 0,
@@ -972,12 +1021,28 @@ const BTR = { VERSION: "0.7.0" };
     const tally = {};
     plan.assignment.forEach(function (host) { tally[host.split(".")[0]] = (tally[host.split(".")[0]] || 0) + 1; });
     env.log("debug", "拆成 " + pieces.length + " 块，分配", tally);
+    // 到点就交回，不管还有几块在途。播放器（真机三份日志、三个版本一致）从发出请求算起
+    // 大约只等 2.45 秒：在此之前交出去的每一段都被用了，在此之后交出去的每一段都被丢掉，
+    // 然后它隔几秒再把同一段要一遍。所以拖过时限再拼好毫无价值，只会占着连接、
+    // 把抽风时的坏样本继续写进节点记忆。直连是流式的，它的第一个字节几十到几百毫秒就到，
+    // 在 1.9 秒交回原连接还赶得上播放器的耐心。
+    let handover = null;
+    const guard = new Promise(function (_resolve, reject) {
+      if (!env.api.setTimeout) return;
+      handover = env.api.setTimeout(function () {
+        handover = null;
+        plan.aborted = true;
+        reject(env.makeError("Deadline", "这次请求的总时限已到，交回原连接"));
+      }, Math.max(0, plan.deadlineAt - Date.now()));
+    });
     let results;
     try {
-      results = await Promise.all(pieces.map(function (piece) { return downloadPiece(piece, plan); }));
+      results = await Promise.race([Promise.all(pieces.map(function (piece) { return downloadPiece(piece, plan); })), guard]);
     } catch (error) {
       plan.aborted = true;
       throw error;
+    } finally {
+      if (handover !== null && env.api.clearTimeout) env.api.clearTimeout(handover);
     }
     let total = null;
     results.forEach(function (result) {
@@ -1006,6 +1071,7 @@ const BTR = { VERSION: "0.7.0" };
       usage: plan.usage,
       attempts: plan.attempts,
       hedges: plan.hedges,
+      leader: plan.assignment[0] || "",
       pieceMsMin: plan.pieceMs.length ? Math.min.apply(null, plan.pieceMs) : 0,
       pieceMsMax: plan.pieceMs.length ? Math.max.apply(null, plan.pieceMs) : 0,
       elapsedMs
@@ -1121,7 +1187,7 @@ const BTR = { VERSION: "0.7.0" };
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 6;
+  const SETTINGS_REVISION = 7;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -1137,6 +1203,11 @@ const BTR = { VERSION: "0.7.0" };
     if (revision < 5 && Number(raw.attemptTimeoutSec) === 6) delete raw.attemptTimeoutSec;
     // 第 6 版：总时限 3 → 8 秒。3 秒是个错误，一次失败就没有重试的余地了。
     if (revision < 6 && Number(raw.deadlineSec) === 3) delete raw.deadlineSec;
+    // 第 7 版：总时限改成毫秒计，默认 1.9 秒。8 秒是第 6 版的默认值；用户自己填过的换算过去。
+    if (revision < 7 && raw.deadlineSec !== undefined) {
+      if (Number(raw.deadlineSec) !== 8 && raw.deadlineMs === undefined) raw.deadlineMs = Number(raw.deadlineSec) * 1000;
+      delete raw.deadlineSec;
+    }
     return core.normalizeSettings(raw);
   }
 
@@ -1154,14 +1225,20 @@ const BTR = { VERSION: "0.7.0" };
       swapSingle: settings.swapSingle,
       subrequestScheme: settings.subrequestScheme,
       attemptTimeoutSec: settings.attemptTimeoutSec,
-      deadlineSec: settings.deadlineSec,
+      deadlineMs: settings.deadlineMs,
       debug: settings.debug
     };
     return env.store.writeJson(SETTINGS_KEY, plain);
   }
 
   function emptyStats() {
-    return { since: Date.now(), seen: 0, accelerated: 0, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, recent: [], schemes: {}, lastHttpAt: 0, lastHttpsAt: 0 };
+    return { since: Date.now(), seen: 0, accelerated: 0, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, recent: [], schemes: {}, lastHttpAt: 0, lastHttpsAt: 0, patience: emptyPatience() };
+  }
+
+  // 播放器的耐心：我们交出去的段里，被用了的最慢一段花了多久，被丢掉的最快一段花了多久。
+  // 这两个数夹住的就是播放器的超时线；它会不会随网络变，看这里最直接。
+  function emptyPatience() {
+    return { used: 0, usedMaxMs: 0, wasted: 0, wastedMinMs: 0 };
   }
 
   function loadStats() {
@@ -1170,6 +1247,7 @@ const BTR = { VERSION: "0.7.0" };
     if (!stored.passthrough || typeof stored.passthrough !== "object") stored.passthrough = {};
     if (!Array.isArray(stored.recent)) stored.recent = [];
     if (!stored.schemes || typeof stored.schemes !== "object") stored.schemes = {};
+    if (!stored.patience || typeof stored.patience !== "object") stored.patience = emptyPatience();
     return stored;
   }
 
@@ -1229,7 +1307,7 @@ const BTR = { VERSION: "0.7.0" };
   // 上一次运行写下的东西这次还在不在。第三项才是“统计一直清零”要看的那一项。
   const STORE_KEYS = [
     ["btr.settings", "设置"], ["btr.stats", "统计"], ["btr.health", "节点记忆"], ["btr.log", "日志"],
-    ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"],
+    ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"], ["btr.delivered", "交付记录"],
     ["btr.lastMedia", "测速用地址"], ["btr.sizes", "文件大小记忆"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
   ];
 
@@ -1268,8 +1346,54 @@ const BTR = { VERSION: "0.7.0" };
     } else {
       stats.passthrough[entry.reason] = (stats.passthrough[entry.reason] || 0) + 1;
     }
+    const patience = stats.patience || (stats.patience = emptyPatience());
+    if (Array.isArray(entry.usedMs)) {
+      entry.usedMs.forEach(function (ms) {
+        patience.used += 1;
+        patience.usedMaxMs = Math.max(patience.usedMaxMs, ms);
+      });
+      delete entry.usedMs;
+    }
+    if (entry.redo > 0) {
+      patience.wasted += 1;
+      patience.wastedMinMs = patience.wastedMinMs ? Math.min(patience.wastedMinMs, entry.redo) : entry.redo;
+    }
     stats.recent.unshift(entry);
     if (stats.recent.length > RECENT_LIMIT) stats.recent.length = RECENT_LIMIT;
+  }
+
+  // 最近交出去的段。播放器丢掉一段之后会在几秒内把同一段（偶尔从段中间某个位置起）再要一遍，
+  // 所以一段交出去十五秒内没被再要，就算被用了。每段只记路径、区间、时刻、耗时。
+  const DELIVERED_KEY = "btr.delivered";
+  const DELIVERED_WINDOW_MS = 15 * 1000;
+  const DELIVERED_LIMIT = 40;
+
+  function loadDelivered() {
+    const stored = env.store.readJson(DELIVERED_KEY, null);
+    return Array.isArray(stored) ? stored : [];
+  }
+
+  function rememberDelivered(path, range, elapsedMs) {
+    const list = loadDelivered();
+    list.push({ path: String(path), start: range.start, end: range.end, at: Date.now(), ms: Math.round(elapsedMs) });
+    while (list.length > DELIVERED_LIMIT) list.shift();
+    env.store.writeJson(DELIVERED_KEY, list);
+  }
+
+  // 这个请求是不是在再要一段我们刚交出去的。返回 { redoMs, usedMs }：redoMs 是被丢的那份当时
+  // 花了多久（0 表示不是再要）；usedMs 是这次顺手结算出来的、已经过了窗口没被再要的那些段的耗时。
+  function noteRedo(path, range) {
+    const now = Date.now();
+    const list = loadDelivered();
+    const usedMs = [];
+    let redoMs = 0;
+    const keep = list.filter(function (item) {
+      if (now - item.at > DELIVERED_WINDOW_MS) { usedMs.push(item.ms); return false; }
+      if (!redoMs && item.path === String(path) && range.start >= item.start && range.start <= item.end) { redoMs = item.ms; return false; }
+      return true;
+    });
+    if (keep.length !== list.length) env.store.writeJson(DELIVERED_KEY, keep);
+    return { redoMs, usedMs };
   }
 
   // 最近几次多线程请求的实测速度（字节每秒）。超量回传靠它估算“多给这么多还来不来得及”，
@@ -1456,7 +1580,7 @@ const BTR = { VERSION: "0.7.0" };
       swapSingle: truthy(query.swapSingle),
       subrequestScheme: query.subrequestScheme,
       attemptTimeoutSec: Number(query.attemptTimeoutSec),
-      deadlineSec: Number(query.deadlineSec),
+      deadlineMs: Number(query.deadlineMs),
       debug: truthy(query.debug)
     });
   }
@@ -1508,6 +1632,22 @@ const BTR = { VERSION: "0.7.0" };
   };
 
   const RESULT_LABELS = { accelerated: "多线程", rewritten: "只换节点", passthrough: "原样放过" };
+
+  // 「用了的最慢 2392 ms · 丢了的最快 2535 ms」。两个数夹住的就是播放器的超时线。
+  function patienceText(patience) {
+    const p = patience || emptyPatience();
+    if (!p.used && !p.wasted) return "还没量到";
+    const parts = [];
+    if (p.used) parts.push("用了的最慢 " + p.usedMaxMs + " ms");
+    if (p.wasted) parts.push("丢了的最快 " + p.wastedMinMs + " ms");
+    return parts.join(" · ");
+  }
+
+  function patienceNote(patience) {
+    const p = patience || emptyPatience();
+    if (!p.used && !p.wasted) return "交出去的段被用了还是被丢了，播一会儿就有数";
+    return "被用 " + p.used + " 段，被丢 " + p.wasted + " 段。总时限应明显低于「丢了的最快」";
+  }
 
   function renderPage(state) {
     const settings = state.settings;
@@ -1618,6 +1758,7 @@ const BTR = { VERSION: "0.7.0" };
       + "<div><small>统计开始于" + (state.statsStored ? "" : "（这次新建的）") + "</small><b>" + formatTime(stats.since) + "</b></div>"
       + "<div><small>分片脚本运行过</small><b>" + mediaRuns + " 次</b>" + (beat.mediaAt ? "<small>最后一次 " + formatTime(beat.mediaAt) + "</small>" : "<small>还没跑过</small>") + "</div>"
       + "<div><small>设置页打开过</small><b>" + pageOpens + " 次</b><small>刷新一次应当 +1</small></div>"
+      + "<div><small>播放器的耐心</small><b>" + patienceText(stats.patience) + "</b><small>" + patienceNote(stats.patience) + "</small></div>"
       + "</div></div>"
       + "<form class=card method=get action=\"/save\">"
       + "<h2 style=\"margin-top:0\">设置</h2>"
@@ -1644,7 +1785,7 @@ const BTR = { VERSION: "0.7.0" };
       + "<option value=keep" + selected(settings.subrequestScheme === "keep") + ">跟原地址一样</option>"
       + "<option value=https" + selected(settings.subrequestScheme === "https") + ">强制 https</option></select></label>"
       + "<label class=row><span>单块超时 (秒)</span><input type=number name=attemptTimeoutSec min=3 max=30 step=1 value=" + settings.attemptTimeoutSec + "></label>"
-      + "<label class=row><span>单个分片总时限 (秒)<small>到点还没拼完就交回原连接</small></span><input type=number name=deadlineSec min=5 max=40 step=1 value=" + settings.deadlineSec + "></label>"
+      + "<label class=row><span>单个分片总时限 (毫秒)<small>到点不管还差几块，一律交回原连接。播放器大约只等 2.45 秒（见上面「播放器的耐心」），拖过去再拼好也会被丢掉；直连的第一个字节很快就到，所以要留出余量</small></span><input type=number name=deadlineMs min=800 max=40000 step=100 value=" + settings.deadlineMs + "></label>"
       + "<label class=row><span>调试日志<small>在 Shadowrocket 的脚本日志里看每块的去向</small></span><input type=checkbox name=debug value=1" + checked(settings.debug) + "></label>"
       + "<button type=submit>保存</button>"
       + "</form>"
@@ -1910,7 +2051,8 @@ const BTR = { VERSION: "0.7.0" };
       // “全部重置”连设置一起恢复默认，不然线程数、每块大小这些会留着上次存的值。
       if (what === "settings" || what === "all") env.store.writeJson(SETTINGS_KEY, { revision: SETTINGS_REVISION });
       if (what === "stats" || what === "all") saveStats(emptyStats());
-      if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
+      // 直接写空，不走 saveHealth：那个会跟存储里现有的记录合并，重置就重置不掉了。
+      if (what === "health" || what === "all") env.store.writeJson(BTR.accelerator.HEALTH_KEY, { hosts: {} });
       if (what === "env" || what === "all") { saveEnvFlags({}); env.store.writeJson(PROBE_KEY, {}); }
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
       if (what === "all") {
@@ -1981,7 +2123,9 @@ const BTR = { VERSION: "0.7.0" };
     loadEnvFlags,
     loadLastMedia,
     loadLog,
+    noteRedo,
     releaseInflight,
+    rememberDelivered,
     rememberMedia,
     loadSettings,
     loadStats,
@@ -2093,6 +2237,10 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     // （多出来的那截不能越过文件末尾）、最近几次的实测速度撑得住、不在限流中。
     const target = overfetchTarget(parts, range, settings, health, entry);
     const inflightKey = parts.path + "#" + range.start + "-" + range.end;
+    // 这段是不是我们刚交出去过的：是的话，上次那份被播放器丢了。这是量「播放器耐心」的唯一办法。
+    const redo = settingsModule.noteRedo(parts.path, range);
+    if (redo.redoMs) entry.redo = redo.redoMs;
+    if (redo.usedMs.length) entry.usedMs = redo.usedMs;
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
     const runId = String(startedAtOf(entry)) + Math.random().toString(36).slice(2, 7);
@@ -2114,6 +2262,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.threads = download.pieces;
+      entry.leader = download.leader;
       entry.hosts = download.usage;
       entry.attempts = download.attempts;
       entry.hedges = download.hedges;
@@ -2131,6 +2280,8 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
         "Cache-Control": "no-store",
         "X-BTR": BTR.VERSION + "; pieces=" + download.pieces + "; hosts=" + Object.keys(download.usage).length + "; ms=" + download.elapsedMs
       };
+      // 记的是从请求进来到交出去的全程，播放器的耐心量的就是这个。
+      settingsModule.rememberDelivered(parts.path, target, Date.now() - startedAtOf(entry));
       return { result: "accelerated", reason: "ok", done: { response: { status: 206, headers: responseHeaders, body: download.bytes } } };
     } catch (error) {
       settingsModule.releaseBusy(runId);
@@ -2207,10 +2358,15 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       env.log("error", "统计保存失败", error);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
+    // 节点名只留能认出来的那一截：upos-sz-mirrorali.bilivideo.com → mirrorali。
+    const shortHost = function (host) {
+      return String(host || "").replace(/^upos-[a-z]{2}-/, "").replace(/\.(bilivideo\.(com|cn|net)|akamaized\.net|szbdyd\.com)(:\d+)?$/, "");
+    };
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "") + (entry.overfetch ? " 多给 " + Math.round(entry.overfetch / 1024) + "KiB" : "")
-      : entry.rewrittenTo || entry.error || "";
-    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
+      ? "领跑 " + shortHost(entry.leader) + " 原 " + shortHost(parts.host) + " " + JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "") + (entry.overfetch ? " 多给 " + Math.round(entry.overfetch / 1024) + "KiB" : "")
+      : (entry.rewrittenTo ? "→ " + shortHost(entry.rewrittenTo) + " " : "") + (entry.error || "") + (entry.kind !== "unknown" ? " 原 " + shortHost(parts.host) : "");
+    const redoNote = entry.redo ? "（" + entry.redo + "ms 前交出的那份被丢了）" : "";
+    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms" + redoNote, detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }
     catch (error) { env.log("error", "日志保存失败", error); }
     env.finish(outcome.done);

@@ -48,7 +48,7 @@
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 6;
+  const SETTINGS_REVISION = 7;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -64,6 +64,11 @@
     if (revision < 5 && Number(raw.attemptTimeoutSec) === 6) delete raw.attemptTimeoutSec;
     // 第 6 版：总时限 3 → 8 秒。3 秒是个错误，一次失败就没有重试的余地了。
     if (revision < 6 && Number(raw.deadlineSec) === 3) delete raw.deadlineSec;
+    // 第 7 版：总时限改成毫秒计，默认 1.9 秒。8 秒是第 6 版的默认值；用户自己填过的换算过去。
+    if (revision < 7 && raw.deadlineSec !== undefined) {
+      if (Number(raw.deadlineSec) !== 8 && raw.deadlineMs === undefined) raw.deadlineMs = Number(raw.deadlineSec) * 1000;
+      delete raw.deadlineSec;
+    }
     return core.normalizeSettings(raw);
   }
 
@@ -81,14 +86,20 @@
       swapSingle: settings.swapSingle,
       subrequestScheme: settings.subrequestScheme,
       attemptTimeoutSec: settings.attemptTimeoutSec,
-      deadlineSec: settings.deadlineSec,
+      deadlineMs: settings.deadlineMs,
       debug: settings.debug
     };
     return env.store.writeJson(SETTINGS_KEY, plain);
   }
 
   function emptyStats() {
-    return { since: Date.now(), seen: 0, accelerated: 0, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, recent: [], schemes: {}, lastHttpAt: 0, lastHttpsAt: 0 };
+    return { since: Date.now(), seen: 0, accelerated: 0, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, recent: [], schemes: {}, lastHttpAt: 0, lastHttpsAt: 0, patience: emptyPatience() };
+  }
+
+  // 播放器的耐心：我们交出去的段里，被用了的最慢一段花了多久，被丢掉的最快一段花了多久。
+  // 这两个数夹住的就是播放器的超时线；它会不会随网络变，看这里最直接。
+  function emptyPatience() {
+    return { used: 0, usedMaxMs: 0, wasted: 0, wastedMinMs: 0 };
   }
 
   function loadStats() {
@@ -97,6 +108,7 @@
     if (!stored.passthrough || typeof stored.passthrough !== "object") stored.passthrough = {};
     if (!Array.isArray(stored.recent)) stored.recent = [];
     if (!stored.schemes || typeof stored.schemes !== "object") stored.schemes = {};
+    if (!stored.patience || typeof stored.patience !== "object") stored.patience = emptyPatience();
     return stored;
   }
 
@@ -156,7 +168,7 @@
   // 上一次运行写下的东西这次还在不在。第三项才是“统计一直清零”要看的那一项。
   const STORE_KEYS = [
     ["btr.settings", "设置"], ["btr.stats", "统计"], ["btr.health", "节点记忆"], ["btr.log", "日志"],
-    ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"],
+    ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"], ["btr.delivered", "交付记录"],
     ["btr.lastMedia", "测速用地址"], ["btr.sizes", "文件大小记忆"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
   ];
 
@@ -195,8 +207,54 @@
     } else {
       stats.passthrough[entry.reason] = (stats.passthrough[entry.reason] || 0) + 1;
     }
+    const patience = stats.patience || (stats.patience = emptyPatience());
+    if (Array.isArray(entry.usedMs)) {
+      entry.usedMs.forEach(function (ms) {
+        patience.used += 1;
+        patience.usedMaxMs = Math.max(patience.usedMaxMs, ms);
+      });
+      delete entry.usedMs;
+    }
+    if (entry.redo > 0) {
+      patience.wasted += 1;
+      patience.wastedMinMs = patience.wastedMinMs ? Math.min(patience.wastedMinMs, entry.redo) : entry.redo;
+    }
     stats.recent.unshift(entry);
     if (stats.recent.length > RECENT_LIMIT) stats.recent.length = RECENT_LIMIT;
+  }
+
+  // 最近交出去的段。播放器丢掉一段之后会在几秒内把同一段（偶尔从段中间某个位置起）再要一遍，
+  // 所以一段交出去十五秒内没被再要，就算被用了。每段只记路径、区间、时刻、耗时。
+  const DELIVERED_KEY = "btr.delivered";
+  const DELIVERED_WINDOW_MS = 15 * 1000;
+  const DELIVERED_LIMIT = 40;
+
+  function loadDelivered() {
+    const stored = env.store.readJson(DELIVERED_KEY, null);
+    return Array.isArray(stored) ? stored : [];
+  }
+
+  function rememberDelivered(path, range, elapsedMs) {
+    const list = loadDelivered();
+    list.push({ path: String(path), start: range.start, end: range.end, at: Date.now(), ms: Math.round(elapsedMs) });
+    while (list.length > DELIVERED_LIMIT) list.shift();
+    env.store.writeJson(DELIVERED_KEY, list);
+  }
+
+  // 这个请求是不是在再要一段我们刚交出去的。返回 { redoMs, usedMs }：redoMs 是被丢的那份当时
+  // 花了多久（0 表示不是再要）；usedMs 是这次顺手结算出来的、已经过了窗口没被再要的那些段的耗时。
+  function noteRedo(path, range) {
+    const now = Date.now();
+    const list = loadDelivered();
+    const usedMs = [];
+    let redoMs = 0;
+    const keep = list.filter(function (item) {
+      if (now - item.at > DELIVERED_WINDOW_MS) { usedMs.push(item.ms); return false; }
+      if (!redoMs && item.path === String(path) && range.start >= item.start && range.start <= item.end) { redoMs = item.ms; return false; }
+      return true;
+    });
+    if (keep.length !== list.length) env.store.writeJson(DELIVERED_KEY, keep);
+    return { redoMs, usedMs };
   }
 
   // 最近几次多线程请求的实测速度（字节每秒）。超量回传靠它估算“多给这么多还来不来得及”，
@@ -383,7 +441,7 @@
       swapSingle: truthy(query.swapSingle),
       subrequestScheme: query.subrequestScheme,
       attemptTimeoutSec: Number(query.attemptTimeoutSec),
-      deadlineSec: Number(query.deadlineSec),
+      deadlineMs: Number(query.deadlineMs),
       debug: truthy(query.debug)
     });
   }
@@ -435,6 +493,22 @@
   };
 
   const RESULT_LABELS = { accelerated: "多线程", rewritten: "只换节点", passthrough: "原样放过" };
+
+  // 「用了的最慢 2392 ms · 丢了的最快 2535 ms」。两个数夹住的就是播放器的超时线。
+  function patienceText(patience) {
+    const p = patience || emptyPatience();
+    if (!p.used && !p.wasted) return "还没量到";
+    const parts = [];
+    if (p.used) parts.push("用了的最慢 " + p.usedMaxMs + " ms");
+    if (p.wasted) parts.push("丢了的最快 " + p.wastedMinMs + " ms");
+    return parts.join(" · ");
+  }
+
+  function patienceNote(patience) {
+    const p = patience || emptyPatience();
+    if (!p.used && !p.wasted) return "交出去的段被用了还是被丢了，播一会儿就有数";
+    return "被用 " + p.used + " 段，被丢 " + p.wasted + " 段。总时限应明显低于「丢了的最快」";
+  }
 
   function renderPage(state) {
     const settings = state.settings;
@@ -545,6 +619,7 @@
       + "<div><small>统计开始于" + (state.statsStored ? "" : "（这次新建的）") + "</small><b>" + formatTime(stats.since) + "</b></div>"
       + "<div><small>分片脚本运行过</small><b>" + mediaRuns + " 次</b>" + (beat.mediaAt ? "<small>最后一次 " + formatTime(beat.mediaAt) + "</small>" : "<small>还没跑过</small>") + "</div>"
       + "<div><small>设置页打开过</small><b>" + pageOpens + " 次</b><small>刷新一次应当 +1</small></div>"
+      + "<div><small>播放器的耐心</small><b>" + patienceText(stats.patience) + "</b><small>" + patienceNote(stats.patience) + "</small></div>"
       + "</div></div>"
       + "<form class=card method=get action=\"/save\">"
       + "<h2 style=\"margin-top:0\">设置</h2>"
@@ -571,7 +646,7 @@
       + "<option value=keep" + selected(settings.subrequestScheme === "keep") + ">跟原地址一样</option>"
       + "<option value=https" + selected(settings.subrequestScheme === "https") + ">强制 https</option></select></label>"
       + "<label class=row><span>单块超时 (秒)</span><input type=number name=attemptTimeoutSec min=3 max=30 step=1 value=" + settings.attemptTimeoutSec + "></label>"
-      + "<label class=row><span>单个分片总时限 (秒)<small>到点还没拼完就交回原连接</small></span><input type=number name=deadlineSec min=5 max=40 step=1 value=" + settings.deadlineSec + "></label>"
+      + "<label class=row><span>单个分片总时限 (毫秒)<small>到点不管还差几块，一律交回原连接。播放器大约只等 2.45 秒（见上面「播放器的耐心」），拖过去再拼好也会被丢掉；直连的第一个字节很快就到，所以要留出余量</small></span><input type=number name=deadlineMs min=800 max=40000 step=100 value=" + settings.deadlineMs + "></label>"
       + "<label class=row><span>调试日志<small>在 Shadowrocket 的脚本日志里看每块的去向</small></span><input type=checkbox name=debug value=1" + checked(settings.debug) + "></label>"
       + "<button type=submit>保存</button>"
       + "</form>"
@@ -837,7 +912,8 @@
       // “全部重置”连设置一起恢复默认，不然线程数、每块大小这些会留着上次存的值。
       if (what === "settings" || what === "all") env.store.writeJson(SETTINGS_KEY, { revision: SETTINGS_REVISION });
       if (what === "stats" || what === "all") saveStats(emptyStats());
-      if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
+      // 直接写空，不走 saveHealth：那个会跟存储里现有的记录合并，重置就重置不掉了。
+      if (what === "health" || what === "all") env.store.writeJson(BTR.accelerator.HEALTH_KEY, { hosts: {} });
       if (what === "env" || what === "all") { saveEnvFlags({}); env.store.writeJson(PROBE_KEY, {}); }
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
       if (what === "all") {
@@ -908,7 +984,9 @@
     loadEnvFlags,
     loadLastMedia,
     loadLog,
+    noteRedo,
     releaseInflight,
+    rememberDelivered,
     rememberMedia,
     loadSettings,
     loadStats,

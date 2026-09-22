@@ -293,8 +293,10 @@ test("自动模式：没有测速数据时热身撒到原节点和所有节点�
   assert.equal(second.value.response.status, 206);
   const usage = second.value.response.headers["X-BTR"];
   const hosts = server.requests.map((item) => item.host);
-  const slowUsed = hosts.filter((host) => host === "upos-sz-mirrorhw.bilivideo.com" || host === "upos-hz-mirrorakam.akamaized.net").length;
+  const slowUsed = hosts.filter((host) => host === "upos-sz-mirrorhw.bilivideo.com").length;
   assert.equal(slowUsed, 0, `慢节点不该再拿到块：${hosts.join(",")} ${usage}`);
+  // App 自己的节点是例外：领跑位不在它身上时，每段留最后一块去试它，不然永远回不去。
+  assert.equal(hosts.filter((host) => host === "upos-hz-mirrorakam.akamaized.net").length, 1, `App 自己的节点每段试一块：${hosts.join(",")}`);
   assert.ok(hosts.filter((host) => host === "upos-sz-mirrorcosov.bilivideo.com").length >= 2);
 });
 
@@ -342,4 +344,51 @@ test("子请求可以强制走 https（这里只检查地址协议，本地服�
   const { value } = await env.run(mediaRequest());
   assert.equal(value.response.status, 206);
   for (const call of env.clientCalls) assert.ok(call.url.startsWith("https://"), call.url);
+});
+
+test("到了总时限就交回原连接，不等在途的块：播放器只等 2.45 秒，拖过去再拼好也会被丢", async () => {
+  for (const host of MAINLAND) server.setBehavior(host, { delayMs: 3000 });
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 7, mode: "mainland", deadlineMs: 800 });
+  const env = createEnv({ server, store });
+  const { value, elapsedMs } = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.deepEqual(value, {}, "到点必须 $done({}) 交回原连接");
+  assert.ok(elapsedMs >= 750 && elapsedMs < 1300, `应在 800 毫秒左右交回，实际 ${elapsedMs}ms`);
+  const stats = store.json("btr.stats");
+  assert.equal(stats.passthrough.deadline, 1);
+  assert.match(stats.recent[0].error, /Deadline/);
+  // 交回之后不再发新请求；已经发出去的由环境自己收拾。
+  const sent = server.requests.length;
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(server.requests.length, sent, "交回之后不该再发请求");
+});
+
+test("量播放器的耐心：交出去的段几秒内又被要了就算被丢，过了窗口没再要就算被用", async () => {
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 7, mode: "mainland", threads: 4 });
+  // 一条 20 秒前交出去、没被再要的记录：这次运行顺手结算成「被用」。
+  store.setJson("btr.delivered", [{ path: "/upgcxcode/old.m4s", start: 0, end: 1048575, at: Date.now() - 20000, ms: 2392 }]);
+  const env = createEnv({ server, store });
+  const first = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.equal(first.value.response.status, 206);
+  let stats = store.json("btr.stats");
+  assert.equal(stats.patience.used, 1);
+  assert.equal(stats.patience.usedMaxMs, 2392);
+  assert.equal(stats.patience.wasted, 0);
+  const delivered = store.json("btr.delivered");
+  assert.equal(delivered.length, 1, "刚交出去的这段记下来了，旧的那条结算后删掉");
+  assert.equal(delivered[0].start, 0);
+  // 同一段马上又来要（从段中间某个位置起也算）：上一份被丢了。
+  const again = await env.run(mediaRequest({ headers: { Range: "bytes=524288-1048575" } }));
+  assert.equal(again.value.response.status, 206);
+  stats = store.json("btr.stats");
+  assert.equal(stats.patience.wasted, 1);
+  assert.ok(Math.abs(stats.patience.wastedMinMs - stats.recent[1].elapsedMs) <= 2, "被丢的那份当时的耗时");
+  assert.equal(stats.recent[0].redo, stats.patience.wastedMinMs);
+  const log = store.json("btr.log").join("\n");
+  assert.match(log, /前交出的那份被丢了/);
+  assert.match(log, /领跑 \S+ 原 mirrorakam/, "日志里要写领跑者和 App 原本的节点");
+  const page = (await createEnv({ server: null, store }).run({ url: "http://btr.settings/", method: "GET", headers: {} })).value.response.body;
+  assert.ok(page.includes("用了的最慢 2392 ms"), "设置页显示播放器的耐心");
+  assert.ok(page.includes("丢了的最快"));
 });
