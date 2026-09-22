@@ -44,3 +44,16 @@ new vm.Script(output, { filename: "bilibili-thread-ripper.js" });
 fs.mkdirSync(path.dirname(OUTPUT), { recursive: true });
 fs.writeFileSync(OUTPUT, output, "utf8");
 console.log(`已生成 ${path.relative(root, OUTPUT)}（${output.length} 字节）`);
+
+// 模块和配置文件里的脚本地址带 ?v=版本：Shadowrocket 和 GitHub 的 CDN 都会缓存脚本文件，
+// 地址变了才会重新下载。每次构建把版本号同步进去。
+for (const file of fs.readdirSync(path.join(root, "shadowrocket"))) {
+  if (!/\.(sgmodule|conf)$/.test(file)) continue;
+  const target = path.join(root, "shadowrocket", file);
+  const before = fs.readFileSync(target, "utf8");
+  const after = before.replace(/(bilibili-thread-ripper\.js)(\?v=[^\s,]*)?/g, `$1?v=${pkg.version}`);
+  if (after !== before) {
+    fs.writeFileSync(target, after, "utf8");
+    console.log(`已同步版本到 shadowrocket/${file}`);
+  }
+}

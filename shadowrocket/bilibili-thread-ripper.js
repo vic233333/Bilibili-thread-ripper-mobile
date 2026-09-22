@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.0
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.1
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.0" };
+const BTR = { VERSION: "0.1.1" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -886,7 +886,7 @@ const BTR = { VERSION: "0.1.0" };
     const recentRows = stats.recent.map(function (entry) {
       const usage = entry.hosts ? Object.keys(entry.hosts).map(function (host) { return host.split(".")[0] + "×" + entry.hosts[host]; }).join(" ") : "";
       const speed = entry.result === "accelerated" && entry.elapsedMs ? formatSpeed(entry.length * 1000 / entry.elapsedMs) : "";
-      return "<tr><td>" + formatTime(entry.at) + "</td><td>" + escapeHtml(entry.kind === "audio" ? "音" : entry.kind === "video" ? "画" : "?") + "</td><td class=host>" + escapeHtml(entry.host || "") + "</td><td class=num>" + escapeHtml(entry.range || "") + "</td><td class=num>" + (entry.length ? formatBytes(entry.length) : "") + "</td><td>" + escapeHtml(RESULT_LABELS[entry.result] || entry.result || "") + (entry.reason && entry.reason !== "ok" ? "<br><small>" + escapeHtml(REASON_LABELS[entry.reason] || entry.reason) + "</small>" : "") + (entry.error ? "<br><small>" + escapeHtml(entry.error) + "</small>" : "") + "</td><td class=num>" + (entry.elapsedMs || 0) + " ms" + (speed ? "<br><small>" + speed + "</small>" : "") + (entry.threads ? "<br><small>" + entry.threads + " 块 " + escapeHtml(usage) + "</small>" : "") + "</td></tr>";
+      return "<tr><td>" + formatTime(entry.at) + "</td><td>" + escapeHtml(entry.kind === "audio" ? "音" : entry.kind === "video" ? "画" : "?") + "</td><td class=host>" + escapeHtml(entry.host || "") + (entry.path ? "<br><small>" + escapeHtml((entry.scheme && entry.scheme !== "http" ? entry.scheme + " " : "") + entry.path) + "</small>" : "") + "</td><td class=num>" + escapeHtml(entry.range || "") + "</td><td class=num>" + (entry.length ? formatBytes(entry.length) : "") + "</td><td>" + escapeHtml(RESULT_LABELS[entry.result] || entry.result || "") + (entry.reason && entry.reason !== "ok" ? "<br><small>" + escapeHtml(REASON_LABELS[entry.reason] || entry.reason) + "</small>" : "") + (entry.error ? "<br><small>" + escapeHtml(entry.error) + "</small>" : "") + "</td><td class=num>" + (entry.elapsedMs || 0) + " ms" + (speed ? "<br><small>" + speed + "</small>" : "") + (entry.threads ? "<br><small>" + entry.threads + " 块 " + escapeHtml(usage) + "</small>" : "") + "</td></tr>";
     }).join("");
     const message = state.message ? "<div class=notice>" + escapeHtml(state.message) + "</div>" : "";
     const auto = AUTO_REFRESH_OPTIONS.indexOf(state.autoRefresh) >= 0 ? state.autoRefresh : 0;
@@ -1181,7 +1181,15 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     const settings = settingsModule.loadSettings();
     env.setDebug(settings.debug);
     const startedAt = Date.now();
-    const entry = { at: startedAt, kind: core.mediaKind(parts.path), host: parts.host, method };
+    // 只记主机、端口和路径，不记带签名的查询串。
+    const entry = {
+      at: startedAt,
+      kind: core.mediaKind(parts.path),
+      host: parts.host + (parts.port ? ":" + parts.port : ""),
+      scheme: parts.scheme,
+      path: parts.path.length > 72 ? "…" + parts.path.slice(-72) : parts.path,
+      method
+    };
     let outcome;
     try {
       outcome = await decide(parts, method, headers, settings, entry);

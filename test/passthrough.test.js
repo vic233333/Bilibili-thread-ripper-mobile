@@ -84,6 +84,11 @@ test("PCDN 的 /v1/resource/ 路径不能换节点，原样放过", async () => 
   const { value, stats } = await runWith(mediaRequest({ url, headers: { Host: "xy1x2x3x4xy.mcdn.bilivideo.cn:8000" } }));
   assert.deepEqual(value, {});
   assert.equal(stats.passthrough.notMedia, 1);
+  // 排错时要能在设置页看到 App 到底请求了什么：主机带端口、路径不带查询串。
+  assert.equal(stats.recent[0].host, "xy1x2x3x4xy.mcdn.bilivideo.cn:8000");
+  assert.equal(stats.recent[0].path, "/v1/resource/123456-1-30080.m4s");
+  assert.equal(stats.recent[0].scheme, "http");
+  assert.ok(!JSON.stringify(stats).includes("agrr="), "统计里不能出现查询串");
 });
 
 test("带有脚本自己标记头的请求立刻放过，不记统计", async () => {

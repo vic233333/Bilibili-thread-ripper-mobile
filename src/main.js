@@ -119,7 +119,15 @@
     const settings = settingsModule.loadSettings();
     env.setDebug(settings.debug);
     const startedAt = Date.now();
-    const entry = { at: startedAt, kind: core.mediaKind(parts.path), host: parts.host, method };
+    // 只记主机、端口和路径，不记带签名的查询串。
+    const entry = {
+      at: startedAt,
+      kind: core.mediaKind(parts.path),
+      host: parts.host + (parts.port ? ":" + parts.port : ""),
+      scheme: parts.scheme,
+      path: parts.path.length > 72 ? "…" + parts.path.slice(-72) : parts.path,
+      method
+    };
     let outcome;
     try {
       outcome = await decide(parts, method, headers, settings, entry);

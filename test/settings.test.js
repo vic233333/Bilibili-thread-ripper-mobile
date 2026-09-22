@@ -217,3 +217,27 @@ test("构建产物带有原作署名，且与 package.json 版本一致", () => 
   assert.ok(bundle.includes(`const BTR = { VERSION: "${pkg.version}" };`));
   assert.ok(!/\$request\s*=/.test(bundle.replace(/typeof \$request/g, "")), "不要给环境变量赋值");
 });
+
+test("模块和配置文件里的脚本地址都带当前版本号，匹配规则覆盖所有 B 站 CDN 主机", () => {
+  const dir = path.resolve(__dirname, "..", "shadowrocket");
+  const files = fs.readdirSync(dir).filter((file) => /\.(sgmodule|conf)$/.test(file));
+  assert.equal(files.length, 4);
+  for (const file of files) {
+    const text = fs.readFileSync(path.join(dir, file), "utf8");
+    const scriptLines = text.split("\n").filter((line) => /^btr-(media|settings) = /.test(line));
+    assert.equal(scriptLines.length, 2, file);
+    for (const line of scriptLines) {
+      assert.ok(line.includes(`bilibili-thread-ripper.js?v=${pkg.version}`), `${file}: ${line}`);
+      assert.ok(line.includes("engine=webview"), file);
+    }
+    const media = scriptLines.find((line) => line.startsWith("btr-media"));
+    const pattern = new RegExp(/pattern=(\S+),/.exec(media)[1]);
+    assert.ok(pattern.test("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3/3-1-30080.m4s?x=1"), file);
+    assert.ok(pattern.test("http://xy1x2x3x4xy.mcdn.bilivideo.cn:8000/v1/resource/3-1-30080.m4s?x=1"), file);
+    assert.ok(!pattern.test("http://api.bilibili.com/x/player/playurl"), file);
+    assert.ok(!pattern.test("http://btr.settings/"), file);
+    assert.equal(pattern.test("https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3/3-1-30080.m4s"), file.includes("https"), file);
+    if (file.includes("https")) assert.ok(/^\[MITM\]/m.test(text) && /hostname = .*akamaized\.net/.test(text), file);
+    else assert.ok(!/hostname = /.test(text), file);
+  }
+});
