@@ -39,7 +39,27 @@ B 站 App 播放器（它以为只发了一次请求）
 
 ## 安装
 
-需要 iOS 上的 [Shadowrocket](https://apps.apple.com/us/app/shadowrocket/id932747118)，版本不低于 2.1.62（从这个版本起可以直接运行 Surge 格式脚本）。
+需要 iOS 上的 [Shadowrocket](https://apps.apple.com/us/app/shadowrocket/id932747118)，版本不低于 2.1.62（从这个版本起可以直接运行 Surge 格式脚本）。有两种装法，选一种。
+
+### 方式一：整份配置文件（不用代理、不想折腾的选这个）
+
+一份现成的 Shadowrocket 配置，不含任何代理节点，所有流量直连，只加载线程撕裂者脚本。
+
+1. 在 iPhone 上点这个链接直接导入：`shadowrocket://config/add/https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.conf`
+
+   或者手动：Shadowrocket → 配置 → 右上角 **＋** → 粘贴下面的地址 → 下载：
+
+   ```text
+   https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.conf
+   ```
+
+2. 配置列表里点它 → **使用配置**。
+3. 首页 → 全局路由 保持 **配置**（这份配置的规则本来就是全部直连）。如果连接开关因为没有节点打不开，随便添加一个占位节点，比如 SOCKS5 `127.0.0.1:1080`，它不会被用到。
+4. 打开连接开关，播放一个 B 站视频，再在 Safari 打开 `http://btr.settings/` 看「最近请求」。
+
+更新：配置 → 点这个文件 → 更新，它会按文件里的 `update-url` 重新下载。需要 https 版本时用 `bilibili-thread-ripper-https.conf`，见[下文](#可选也处理-https-的分片)。
+
+### 方式二：模块（已经有自己的配置或订阅的选这个）
 
 1. Shadowrocket → 配置 → 模块 → 右上角 **＋** → 填入模块地址 → 下载：
 
@@ -69,6 +89,8 @@ Shadowrocket 总是带着一个配置运行，但不必是任何订阅：它内�
 ```text
 https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper-https.sgmodule
 ```
+
+用整份配置的话，对应的是 `bilibili-thread-ripper-https.conf`（同一目录，导入方式相同）。
 
 它与默认模块的区别只有两点：脚本匹配 `https?://`；多了一个 `[MITM]` 段，只解密 `*.bilivideo.com`、`*.bilivideo.cn`、`*.bilivideo.net`、`*.akamaized.net` 这几个视频 CDN 域名，B 站的接口域名不在其中。使用前要在 Shadowrocket 里：配置 → HTTPS 解密 → 开启，生成证书 → 安装证书 → 到系统 设置 → 通用 → 关于本机 → 证书信任设置 里完全信任它。两个模块不要同时启用。
 
@@ -115,7 +137,7 @@ https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/s
 
 ## 排错
 
-**设置页打不开**。确认模块已启用且 Shadowrocket 已连接；模块里有一条 `[Host] btr.settings = 127.0.0.1`，如果你的配置改过 DNS 策略导致这条不生效，可以在配置的 `[Host]` 段手动加上同一行。
+**设置页打不开**。确认模块（或整份配置）已启用且 Shadowrocket 已连接。`btr.settings` 不是真实域名，模块和配置里都有一条 `[Host] btr.settings = 185.199.108.153` 把它指到一个会进入隧道的占位地址，请求在发出前就被脚本接住；如果你自己的配置改过 DNS 策略导致这条不生效，在配置的 `[Host]` 段手动加上同一行。看到 GitHub 的 404 页说明域名解析对了但脚本没有接到请求，检查脚本是否下载成功（配置 → 模块 → 点模块看脚本状态）。
 
 **「最近请求」一直是空的**。说明脚本没有匹配到 App 的分片请求。依次检查：B 站 App 的流量是否经过 Shadowrocket（在 Shadowrocket 的「数据」里能否看到 `upos-` 开头的请求）；那些请求是 `http://` 还是 `https://`（默认模块只匹配明文，https 要换[带 HTTPS 的模块变体](#可选也处理-https-的分片)）；路径是否是 `/upgcxcode/`。把 Shadowrocket 「数据」里的请求截图发到 Issue。
 
@@ -143,7 +165,7 @@ src/            脚本源码，按 core → env → accelerator → settings →
   settings.js     设置页、统计、持久化
   main.js         入口：判断拆分、只换节点或放过，保证一定调 $done
 scripts/build.js  把 src/ 拼成 shadowrocket/bilibili-thread-ripper.js
-shadowrocket/     模块文件（默认 http 版、含 HTTPS 解密版）和生成的脚本，模块里的地址指向本仓库 main 分支
+shadowrocket/     模块文件与整份配置文件（各有默认 http 版、含 HTTPS 解密版）和生成的脚本，地址都指向本仓库 main 分支
 test/             本地测试：假 CDN（支持 Range、按节点注入故障）、假脚本环境、node:test 用例
 upstream/         上游原始文件的副本，只作对照
 ```

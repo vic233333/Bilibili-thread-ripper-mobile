@@ -17,5 +17,7 @@ btr-media = type=http-request, pattern=^http:\/\/[^\/]+\.(?:bilivideo\.(?:com|cn
 btr-settings = type=http-request, pattern=^http:\/\/btr\.settings(?:\/.*)?$, requires-body=0, timeout=10, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js
 
 [Host]
-# btr.settings 不是真实域名，指到本机让请求能发出来；请求在发出前就被上面的脚本接住了。
-btr.settings = 127.0.0.1
+# btr.settings 不是真实域名。它要解析到一个会进入 Shadowrocket 隧道的地址，请求才会在发出前
+# 被上面的脚本接住（127.0.0.1 走本机回环，不经过隧道）。这里用 GitHub Pages 的地址占位：
+# 万一脚本没加载，Safari 只会看到 GitHub 的 404 页。
+btr.settings = 185.199.108.153
