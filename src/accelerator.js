@@ -14,6 +14,9 @@
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
   const RETRY_ROUNDS = 2;
   const HEALTH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  // 只有这些错误说明是节点或网络的问题，值得换节点重试并记在节点头上。别的（TypeError、
+  // ReferenceError 之类）是脚本自己或环境的问题，换多少个节点都一样，直接放弃整段。
+  const HOST_ERRORS = ["TimeoutError", "NetworkError", "BadRange", "BadLength", "EmptyBody"];
 
   function loadHealth() {
     const stored = env.store.readJson(HEALTH_KEY, null);
@@ -151,7 +154,10 @@
           result.host = host;
           return result;
         } catch (error) {
-          if (error && error.name === "BinaryUnsupported") throw error;
+          if (!error || HOST_ERRORS.indexOf(error.name) < 0) {
+            plan.aborted = true;
+            throw error || env.makeError("ScriptError", "未知错误");
+          }
           markFailure(plan.health, host, error);
           env.log("debug", "子块 " + piece.index + " 在 " + host + " 失败", error);
           lastError = error;

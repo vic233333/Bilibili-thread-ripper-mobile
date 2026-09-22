@@ -136,7 +136,8 @@
       .map(normalizeCdnHost)
       .filter(function (host, index, all) { return host && all.indexOf(host) === index; })
       .slice(0, 32);
-    const minChunkKiB = Math.round(clamp(source.minChunkKiB, 64, 1024, 256));
+    // 真机上 App 的画面请求是 1 MiB 一段，128 KiB 一块正好拆成 8 块，与默认线程数一致。
+    const minChunkKiB = Math.round(clamp(source.minChunkKiB, 64, 1024, 128));
     return {
       enabled: source.enabled !== false,
       // "split" 拆分并发下载；"swap" 只把请求换到当前模式的节点，单连接。真机上排错时用。

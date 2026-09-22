@@ -54,6 +54,8 @@ function createEnv(options) {
 
   const $httpClient = {
     get(requestOptions, callback) {
+      // 模拟环境层面的故障：桥接函数本身抛出类型错误。
+      if (options.brokenClient) throw new TypeError("Can only call Window.setTimeout on instances of Window");
       const url = new URL(requestOptions.url);
       clientCalls.push(requestOptions);
       const headers = Object.assign({}, requestOptions.headers || {});
@@ -95,6 +97,15 @@ function createEnv(options) {
   };
 
   const $persistentStore = { read: (key) => store.read(key), write: (value, key) => store.write(value, key) };
+  // 模仿 WebView：setTimeout 只能作为全局函数调用，this 必须是 undefined 或全局对象。
+  const strictSetTimeout = function (callback, delayMs) {
+    if (this !== undefined && this !== globalThis) throw new TypeError("Can only call Window.setTimeout on instances of Window");
+    return setTimeout(callback, delayMs);
+  };
+  const strictClearTimeout = function (timer) {
+    if (this !== undefined && this !== globalThis) throw new TypeError("Can only call Window.clearTimeout on instances of Window");
+    return clearTimeout(timer);
+  };
   const $notification = { post: (title, subtitle, body) => notifications.push({ title, subtitle, body }) };
   const fakeConsole = { log: (...args) => logs.push(args.join(" ")) };
 
@@ -113,7 +124,7 @@ function createEnv(options) {
           "$request", "$done", "$httpClient", "$persistentStore", "$notification", "console", "setTimeout", "clearTimeout", "__BTR_EXPOSE__",
           loadBundle()
         );
-        factory(request, $done, $httpClient, $persistentStore, $notification, fakeConsole, setTimeout, clearTimeout, expose);
+        factory(request, $done, $httpClient, $persistentStore, $notification, fakeConsole, strictSetTimeout, strictClearTimeout, expose);
       } catch (error) {
         clearTimeout(timer);
         reject(error);

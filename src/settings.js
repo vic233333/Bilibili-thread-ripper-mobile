@@ -171,6 +171,7 @@
     splitOff: "设置为只换节点",
     binaryUnsupported: "环境不支持二进制响应",
     failed: "多线程下载失败，已交回原连接",
+    scriptError: "脚本或环境出错，已交回原连接（请把日志发到 Issue）",
     error: "脚本出错，已交回原连接",
     deadline: "超过总时限"
   };

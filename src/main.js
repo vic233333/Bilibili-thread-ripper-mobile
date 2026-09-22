@@ -91,7 +91,8 @@
         return single("binaryUnsupported");
       }
       // 多线程失败时把请求原样交回：什么都没改，App 自己去它原来的节点拿。
-      return pass(error && error.name === "Deadline" ? "deadline" : "failed");
+      const hostError = error && ["TimeoutError", "NetworkError", "BadRange", "BadLength", "EmptyBody", "NoHosts", "Budget", "TotalMismatch"].indexOf(error.name) >= 0;
+      return pass(error && error.name === "Deadline" ? "deadline" : hostError ? "failed" : "scriptError");
     }
   }
 

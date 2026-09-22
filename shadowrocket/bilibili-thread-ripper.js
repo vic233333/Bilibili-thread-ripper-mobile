@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.2
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.3
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.2" };
+const BTR = { VERSION: "0.1.3" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -152,7 +152,8 @@ const BTR = { VERSION: "0.1.2" };
       .map(normalizeCdnHost)
       .filter(function (host, index, all) { return host && all.indexOf(host) === index; })
       .slice(0, 32);
-    const minChunkKiB = Math.round(clamp(source.minChunkKiB, 64, 1024, 256));
+    // 真机上 App 的画面请求是 1 MiB 一段，128 KiB 一块正好拆成 8 块，与默认线程数一致。
+    const minChunkKiB = Math.round(clamp(source.minChunkKiB, 64, 1024, 128));
     return {
       enabled: source.enabled !== false,
       // "split" 拆分并发下载；"swap" 只把请求换到当前模式的节点，单连接。真机上排错时用。
@@ -263,8 +264,10 @@ const BTR = { VERSION: "0.1.2" };
     persistentStore: typeof $persistentStore !== "undefined" ? $persistentStore : null,
     notification: typeof $notification !== "undefined" ? $notification : null,
     console: typeof console !== "undefined" ? console : null,
-    setTimeout: typeof setTimeout === "function" ? setTimeout : null,
-    clearTimeout: typeof clearTimeout === "function" ? clearTimeout : null
+    // WebView 引擎里 setTimeout 是 Window 的方法，只能作为全局函数直接调用；存进对象再调
+    // 会报 "Can only call Window.setTimeout on instances of Window"。所以包一层。
+    setTimeout: typeof setTimeout === "function" ? function (callback, delayMs) { return setTimeout(callback, delayMs); } : null,
+    clearTimeout: typeof clearTimeout === "function" ? function (timer) { return clearTimeout(timer); } : null
   };
 
   let debugEnabled = false;
@@ -361,10 +364,19 @@ const BTR = { VERSION: "0.1.2" };
     return null;
   }
 
+  // 脚本自己的错误（类型错误、引用错误等）原样抛出，好在日志里看到真实原因；
+  // 别的都是 $httpClient 报回来的网络问题，归为超时或网络错误，可以换节点重试。
+  function isScriptError(error) {
+    return error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError || error instanceof RangeError;
+  }
+
   function wrapError(error) {
-    if (error instanceof Error) return error;
+    if (isScriptError(error)) return error;
+    if (error instanceof Error && (error.name === "TimeoutError" || error.name === "NetworkError")) return error;
     const message = safeString(error) || "请求失败";
-    return makeError(/time/i.test(message) ? "TimeoutError" : "NetworkError", message);
+    const wrapped = makeError(/time/i.test(message) ? "TimeoutError" : "NetworkError", message);
+    if (error && typeof error === "object" && error.status) wrapped.status = error.status;
+    return wrapped;
   }
 
   // 一次 GET。回调式的 $httpClient 包成 Promise；即使环境不理会 timeout 参数，
@@ -469,6 +481,9 @@ const BTR = { VERSION: "0.1.2" };
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
   const RETRY_ROUNDS = 2;
   const HEALTH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  // 只有这些错误说明是节点或网络的问题，值得换节点重试并记在节点头上。别的（TypeError、
+  // ReferenceError 之类）是脚本自己或环境的问题，换多少个节点都一样，直接放弃整段。
+  const HOST_ERRORS = ["TimeoutError", "NetworkError", "BadRange", "BadLength", "EmptyBody"];
 
   function loadHealth() {
     const stored = env.store.readJson(HEALTH_KEY, null);
@@ -606,7 +621,10 @@ const BTR = { VERSION: "0.1.2" };
           result.host = host;
           return result;
         } catch (error) {
-          if (error && error.name === "BinaryUnsupported") throw error;
+          if (!error || HOST_ERRORS.indexOf(error.name) < 0) {
+            plan.aborted = true;
+            throw error || env.makeError("ScriptError", "未知错误");
+          }
           markFailure(plan.health, host, error);
           env.log("debug", "子块 " + piece.index + " 在 " + host + " 失败", error);
           lastError = error;
@@ -858,6 +876,7 @@ const BTR = { VERSION: "0.1.2" };
     splitOff: "设置为只换节点",
     binaryUnsupported: "环境不支持二进制响应",
     failed: "多线程下载失败，已交回原连接",
+    scriptError: "脚本或环境出错，已交回原连接（请把日志发到 Issue）",
     error: "脚本出错，已交回原连接",
     deadline: "超过总时限"
   };
@@ -1153,7 +1172,8 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
         return single("binaryUnsupported");
       }
       // 多线程失败时把请求原样交回：什么都没改，App 自己去它原来的节点拿。
-      return pass(error && error.name === "Deadline" ? "deadline" : "failed");
+      const hostError = error && ["TimeoutError", "NetworkError", "BadRange", "BadLength", "EmptyBody", "NoHosts", "Budget", "TotalMismatch"].indexOf(error.name) >= 0;
+      return pass(error && error.name === "Deadline" ? "deadline" : hostError ? "failed" : "scriptError");
     }
   }
 

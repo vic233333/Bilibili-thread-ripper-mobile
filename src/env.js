@@ -11,8 +11,10 @@
     persistentStore: typeof $persistentStore !== "undefined" ? $persistentStore : null,
     notification: typeof $notification !== "undefined" ? $notification : null,
     console: typeof console !== "undefined" ? console : null,
-    setTimeout: typeof setTimeout === "function" ? setTimeout : null,
-    clearTimeout: typeof clearTimeout === "function" ? clearTimeout : null
+    // WebView 引擎里 setTimeout 是 Window 的方法，只能作为全局函数直接调用；存进对象再调
+    // 会报 "Can only call Window.setTimeout on instances of Window"。所以包一层。
+    setTimeout: typeof setTimeout === "function" ? function (callback, delayMs) { return setTimeout(callback, delayMs); } : null,
+    clearTimeout: typeof clearTimeout === "function" ? function (timer) { return clearTimeout(timer); } : null
   };
 
   let debugEnabled = false;
@@ -109,10 +111,19 @@
     return null;
   }
 
+  // 脚本自己的错误（类型错误、引用错误等）原样抛出，好在日志里看到真实原因；
+  // 别的都是 $httpClient 报回来的网络问题，归为超时或网络错误，可以换节点重试。
+  function isScriptError(error) {
+    return error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError || error instanceof RangeError;
+  }
+
   function wrapError(error) {
-    if (error instanceof Error) return error;
+    if (isScriptError(error)) return error;
+    if (error instanceof Error && (error.name === "TimeoutError" || error.name === "NetworkError")) return error;
     const message = safeString(error) || "请求失败";
-    return makeError(/time/i.test(message) ? "TimeoutError" : "NetworkError", message);
+    const wrapped = makeError(/time/i.test(message) ? "TimeoutError" : "NetworkError", message);
+    if (error && typeof error === "object" && error.status) wrapped.status = error.status;
+    return wrapped;
   }
 
   // 一次 GET。回调式的 $httpClient 包成 Promise；即使环境不理会 timeout 参数，

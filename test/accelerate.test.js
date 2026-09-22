@@ -127,6 +127,42 @@ test("所有节点都失败时，请求原样交回，不改地址也不改头",
   assert.ok(server.requests.length >= 16, `放弃前至少要把每个节点都试过一遍，实际 ${server.requests.length} 次`);
 });
 
+test("真机上 App 的 1 MiB 画面请求默认拆成 8 块，83 KiB 的音轨请求只换节点", async () => {
+  const env = createEnv({ server });
+  // 真机日志里的请求是 bytes=22020096-23068671 这种正好 1 MiB 的区间；假文件只有 4 MiB，取同样大小的一段。
+  const video = await env.run(mediaRequest({ headers: { Range: "bytes=2097152-3145727" } }));
+  assert.equal(video.value.response.status, 206);
+  assert.ok(/pieces=8;/.test(video.value.response.headers["X-BTR"]), video.value.response.headers["X-BTR"]);
+  assert.ok(Buffer.from(video.value.response.body).equals(expected(2097152, 3145727)));
+  const audio = await env.run(mediaRequest({ url: require("./harness").AUDIO_URL, headers: { Range: "bytes=1402836-1486154" } }));
+  assert.ok(audio.value.url, "音轨请求太小，只换节点");
+  const stats = env.store.json("btr.stats");
+  assert.equal(stats.recent[0].reason, "tooSmall");
+});
+
+test("环境层面的错误（比如 TypeError）不怪到节点头上，整段立刻放弃", async () => {
+  const store = createStore();
+  const env = createEnv({ server, store, brokenClient: true });
+  const { value, elapsedMs } = await env.run(mediaRequest());
+  assert.deepEqual(value, {});
+  assert.ok(elapsedMs < 1000, "不该逐个节点重试");
+  const stats = store.json("btr.stats");
+  assert.equal(stats.passthrough.scriptError, 1, JSON.stringify(stats.passthrough));
+  assert.match(stats.recent[0].error, /TypeError: Can only call Window\.setTimeout/);
+  assert.deepEqual(store.json("btr.health").hosts, {}, "不该给任何节点记失败");
+});
+
+test("$httpClient 回调里的普通 Error 算网络错误，会换节点重试", async () => {
+  const store = createStore();
+  const env = createEnv({ server: null, store });
+  const { value } = await env.run(mediaRequest({ headers: { Range: "bytes=0-524287" } }));
+  assert.deepEqual(value, {});
+  const stats = store.json("btr.stats");
+  assert.equal(stats.passthrough.failed, 1, JSON.stringify(stats.passthrough));
+  assert.match(stats.recent[0].error, /NetworkError: .*no server/);
+  assert.ok(Object.keys(store.json("btr.health").hosts).length >= 2, "节点应被记上失败");
+});
+
 test("海外模式会把 akamai 原地址也留作候选，并且只用海外节点", async () => {
   const store = createStore();
   store.setJson("btr.settings", { mode: "overseas", threads: 4 });
