@@ -105,6 +105,37 @@ test("重置统计、节点记忆和环境标记", async () => {
   assert.deepEqual(store.json("btr.env"), {});
 });
 
+test("全部重置把设置也恢复成默认值", async () => {
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, enabled: true, threads: 16, minChunkKiB: 1024, mode: "mainland", debug: true });
+  store.setJson("btr.busy", { run: { n: 8, at: Date.now() } });
+  store.setJson("btr.lastMedia", { url: "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3/3-1-30080.m4s?x=1", at: Date.now() });
+  const env = createEnv({ server: null, store });
+  const { value } = await env.run(page("/reset?what=all"));
+  assert.ok(value.response.body.includes("已重置"));
+  assert.deepEqual(store.json("btr.settings"), { revision: 3 });
+  assert.deepEqual(store.json("btr.busy"), {});
+  assert.deepEqual(store.json("btr.lastMedia"), {});
+  const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.threads, 6, "线程数回到默认");
+  assert.equal(diag.settings.minChunkKiB, 128, "每块大小回到默认");
+  assert.equal(diag.settings.mode, "auto");
+  assert.equal(diag.settings.debug, false);
+});
+
+test("恢复默认设置只动设置，统计和节点记忆留着", async () => {
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, threads: 16, minChunkKiB: 1024 });
+  store.setJson("btr.stats", { since: 1, seen: 9, accelerated: 3, rewritten: 1, passthrough: {}, bytes: 10, elapsedMs: 10, recent: [] });
+  store.setJson("btr.health", { hosts: { "upos-sz-mirrorali.bilivideo.com": { bps: 1, okAt: Date.now() } } });
+  const env = createEnv({ server: null, store });
+  const { value } = await env.run(page("/reset?what=settings"));
+  assert.ok(value.response.body.includes("恢复默认"));
+  assert.deepEqual(store.json("btr.settings"), { revision: 3 });
+  assert.equal(store.json("btr.stats").seen, 9);
+  assert.ok(store.json("btr.health").hosts["upos-sz-mirrorali.bilivideo.com"]);
+});
+
 test("诊断 JSON 包含版本、能力、设置和统计", async () => {
   const env = createEnv({ server: null });
   const { value } = await env.run(page("/diag.json"));
@@ -123,7 +154,8 @@ test("脚本日志跨运行保存，/log.txt 能看到，可清空", async () =>
   await server.start();
   try {
     const store = createStore();
-    store.setJson("btr.settings", { threads: 2, debug: true });
+    // 固定成大陆节点：原地址的 akamai 不在候选里，noRange 那一次必定换节点，不看测速的脸色。
+    store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 2, debug: true });
     const env = createEnv({ server, store });
     await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
     await env.run(mediaRequest({ noRange: true }));
@@ -359,11 +391,15 @@ test("预取实验页：先交付页面，回调之后把结果写进标记", as
     const { value } = await env.run(page("/probe/after-done"));
     assert.equal(value.response.status, 200);
     assert.ok(value.response.body.includes("预取实验"));
-    assert.equal(store.json("btr.env").afterDone.state, "pending", "页面交出去时还在等回调");
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    assert.equal(store.json("btr.env").afterDone.state, "ok", "Node 里回调当然会到；真机上要看 Shadowrocket");
+    const atDelivery = store.json("btr.env").afterDone;
+    assert.equal(atDelivery.control.state, "ok", "对照那一发在交页面之前就该跑完");
+    assert.equal(atDelivery.pending.state, "sent", "页面交出去时另一发还在路上");
+    await new Promise((resolve) => setTimeout(resolve, 2000));
     const result = JSON.parse((await env.run(page("/probe/after-done/result"))).value.response.body);
-    assert.equal(result.state, "ok");
+    assert.equal(result.pending.state, "ok", "Node 里回调当然会到；真机上要看 Shadowrocket");
+    assert.equal(result.delayed.state, "ok", "交出页面之后由定时器发出的那一发也该跑完");
+    assert.ok(result.pendingCallback.ms >= 0, "真回调到达的时间也要记下来");
+    assert.equal(result.control.bytes, 64 * 1024);
   } finally {
     await server.close();
   }

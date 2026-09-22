@@ -87,6 +87,30 @@ test("一个节点返回 403 时，这块换别的节点重试，整段仍然成
   assert.equal(server.requestsFor("upos-sz-mirrorali.bilivideo.com").length, 0, "退避中的节点不该再被分到块");
 });
 
+test("节点回 412 是限流不是拒绝：只短暂退避，下一段的线程数减半", async () => {
+  server.setBehavior("upos-sz-mirrorali.bilivideo.com", { status: 412 });
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8, minChunkKiB: 128 });
+  const env = createEnv({ server, store });
+  const { value } = await env.run(mediaRequest());
+  assert.equal(value.response.status, 206);
+  const health = store.json("btr.health");
+  const record = health.hosts["upos-sz-mirrorali.bilivideo.com"];
+  assert.ok(record.blockedUntil - Date.now() < 60 * 1000, "限流只短暂退避，不是按拒绝封五分钟");
+  assert.ok(health.pushback.until > Date.now(), "应当记下全局限流");
+  assert.equal(health.pushback.status, 412);
+
+  // 限流期内的下一段：线程数减半，日志里说明还要收着跑多久。
+  server.behaviors = {};
+  server.requests = [];
+  const second = createEnv({ server, store });
+  const next = await second.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.equal(next.value.response.status, 206);
+  const stats = store.json("btr.stats");
+  assert.equal(stats.recent[0].threads, 4, "限流中线程数减半");
+  assert.ok(stats.recent[0].pushback > 0);
+});
+
 test("Content-Range 对不上或长度不符的响应会被拒绝并换节点", async () => {
   server.setBehavior("upos-sz-mirrorhw.bilivideo.com", { wrongRange: true });
   server.setBehavior("upos-sz-mirrorbos.bilivideo.com", { truncate: true });

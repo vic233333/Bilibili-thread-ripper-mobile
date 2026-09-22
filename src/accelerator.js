@@ -20,6 +20,10 @@
   // 只有这些错误说明是节点或网络的问题，值得换节点重试并记在节点头上。别的（TypeError、
   // ReferenceError 之类）是脚本自己或环境的问题，换多少个节点都一样，直接放弃整段。
   const HOST_ERRORS = ["TimeoutError", "NetworkError", "BadRange", "BadLength", "EmptyBody"];
+  // 服务器嫌一次开得太多时会回 412 / 429。这不是节点坏了，是这会儿的并发太高：节点只短暂退避，
+  // 同时接下来三分钟所有请求的线程数减半。取自上游 0.9.4.0 自动线程数里的同一处理。
+  const PUSHBACK_STATUSES = [412, 429];
+  const PUSHBACK_REST_MS = 3 * 60 * 1000;
 
   function loadHealth() {
     const stored = env.store.readJson(HEALTH_KEY, null);
@@ -62,13 +66,21 @@
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
     record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
     const status = Number(error && error.status) || 0;
-    if (status >= 400 && status < 500 && status !== 408 && status !== 429) record.blockedUntil = now + REFUSED_BLOCK_MS;
+    if (PUSHBACK_STATUSES.indexOf(status) >= 0) health.pushback = { until: now + PUSHBACK_REST_MS, status, host };
+    else if (status >= 400 && status < 500 && status !== 408) record.blockedUntil = now + REFUSED_BLOCK_MS;
     record.failAt = now;
     record.lastError = env.safeString(error).slice(0, 100);
   }
 
   function isBlocked(record, now) {
     return Boolean(record) && (record.blockedUntil || 0) > now;
+  }
+
+  // 还要收着劲跑多久（毫秒），0 表示没有限流记录。
+  function pushbackMs(health, now) {
+    const at = Number(now) || Date.now();
+    const until = Number(health && health.pushback && health.pushback.until) || 0;
+    return until > at ? until - at : 0;
   }
 
   function isMeasured(record, now) {
@@ -378,6 +390,7 @@
 
   BTR.accelerator = Object.freeze({
     HEALTH_KEY,
+    PUSHBACK_REST_MS,
     assignPieces,
     downloadRange,
     fetchPiece,
@@ -386,6 +399,7 @@
     markSuccess,
     orderCandidates,
     probeHost,
+    pushbackMs,
     saveHealth
   });
 })(BTR);

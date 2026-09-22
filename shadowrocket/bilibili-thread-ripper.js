@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.2.1
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.2.2
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.2.1" };
+const BTR = { VERSION: "0.2.2" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -395,6 +395,9 @@ const BTR = { VERSION: "0.2.1" };
         return;
       }
       const timeoutSec = Math.max(1, Number(options.timeoutSec) || 8);
+      // 真正的回调什么时候到（哪怕已经超时判负了）：预取实验要靠它判断 $done 之后请求还跑不跑。
+      const onCallback = typeof options.onCallback === "function" ? options.onCallback : null;
+      const sentAt = Date.now();
       let settled = false;
       let timer = null;
       const finish = function (callback, value) {
@@ -416,6 +419,9 @@ const BTR = { VERSION: "0.2.1" };
       };
       try {
         api.httpClient.get(request, function (error, response, data) {
+          if (onCallback) {
+            try { onCallback(error || null, Date.now() - sentAt, response); } catch (_error) {}
+          }
           if (error) {
             finish(reject, wrapError(error));
             return;
@@ -510,6 +516,10 @@ const BTR = { VERSION: "0.2.1" };
   // 只有这些错误说明是节点或网络的问题，值得换节点重试并记在节点头上。别的（TypeError、
   // ReferenceError 之类）是脚本自己或环境的问题，换多少个节点都一样，直接放弃整段。
   const HOST_ERRORS = ["TimeoutError", "NetworkError", "BadRange", "BadLength", "EmptyBody"];
+  // 服务器嫌一次开得太多时会回 412 / 429。这不是节点坏了，是这会儿的并发太高：节点只短暂退避，
+  // 同时接下来三分钟所有请求的线程数减半。取自上游 0.9.4.0 自动线程数里的同一处理。
+  const PUSHBACK_STATUSES = [412, 429];
+  const PUSHBACK_REST_MS = 3 * 60 * 1000;
 
   function loadHealth() {
     const stored = env.store.readJson(HEALTH_KEY, null);
@@ -552,13 +562,21 @@ const BTR = { VERSION: "0.2.1" };
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
     record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
     const status = Number(error && error.status) || 0;
-    if (status >= 400 && status < 500 && status !== 408 && status !== 429) record.blockedUntil = now + REFUSED_BLOCK_MS;
+    if (PUSHBACK_STATUSES.indexOf(status) >= 0) health.pushback = { until: now + PUSHBACK_REST_MS, status, host };
+    else if (status >= 400 && status < 500 && status !== 408) record.blockedUntil = now + REFUSED_BLOCK_MS;
     record.failAt = now;
     record.lastError = env.safeString(error).slice(0, 100);
   }
 
   function isBlocked(record, now) {
     return Boolean(record) && (record.blockedUntil || 0) > now;
+  }
+
+  // 还要收着劲跑多久（毫秒），0 表示没有限流记录。
+  function pushbackMs(health, now) {
+    const at = Number(now) || Date.now();
+    const until = Number(health && health.pushback && health.pushback.until) || 0;
+    return until > at ? until - at : 0;
   }
 
   function isMeasured(record, now) {
@@ -868,6 +886,7 @@ const BTR = { VERSION: "0.2.1" };
 
   BTR.accelerator = Object.freeze({
     HEALTH_KEY,
+    PUSHBACK_REST_MS,
     assignPieces,
     downloadRange,
     fetchPiece,
@@ -876,6 +895,7 @@ const BTR = { VERSION: "0.2.1" };
     markSuccess,
     orderCandidates,
     probeHost,
+    pushbackMs,
     saveHealth
   });
 })(BTR);
@@ -905,6 +925,15 @@ const BTR = { VERSION: "0.2.1" };
   const RECENT_LIMIT = 12;
   const LOG_LIMIT = 300;
   const AUTO_REFRESH_OPTIONS = [5, 15, 30];
+
+  const RESET_LABELS = {
+    settings: "设置（恢复默认）",
+    stats: "统计",
+    health: "节点记忆",
+    env: "环境判断",
+    log: "日志",
+    all: "全部（设置、统计、节点记忆、环境判断、日志）"
+  };
 
   function loadRawSettings() {
     return env.store.readJson(SETTINGS_KEY, {});
@@ -1362,6 +1391,7 @@ const BTR = { VERSION: "0.2.1" };
       + "<a class=\"btn secondary\" href=\"/log.txt\">查看日志</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=log\">清空日志</a>"
       + "<a class=\"btn secondary\" href=\"/diag.json\">诊断 JSON</a>"
+      + "<a class=\"btn secondary\" href=\"/reset?what=settings\">恢复默认设置</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=all\">全部重置</a>"
       + "</div>"
       + "<div class=sub style=\"margin:20px 0\">这个页面由脚本本地生成，不联网。地址栏里的 btr.settings 不是真实域名。<br>原作：<a href=\"https://github.com/MrTangLuyao/Bilibili-thread-ripper\">MrTangLuyao/Bilibili-thread-ripper</a>（MIT）。移植：<a href=\"https://github.com/vic233333/Bilibili-thread-ripper-mobile\">vic233333/Bilibili-thread-ripper-mobile</a>。</div>"
@@ -1419,33 +1449,100 @@ const BTR = { VERSION: "0.2.1" };
 
   // 先把结果标成“已发出、等待回调”，立刻返回页面；回调若在 $done 之后到达，会把结果改成 ok。
   // 页面自己隔两秒去读结果。请求用的是最近一次视频地址上的 64 KiB。
+  // 预取实验：脚本把页面交给 $done 之后，它还剩下什么能力？分四项记录，页面轮询
+  // /probe/after-done/result 看结果。
+  //   control —— 交出页面之前就跑完的请求，用来证明这个节点此刻确实连得上、要多久；
+  //   pending —— 交出页面之前发出、回调落在 $done 之后的请求，预取要用的就是它；
+  //   delayed —— 交出页面之后由定时器发出的请求；
+  //   timer   —— 一个 25 秒的定时器，证明脚本上下文还活着、还能写存储。
+  // 只有 control 成功而 pending、delayed 都收不到回调，才能断定是环境不让跑，而不是节点连不上。
+  const PROBE_BYTES = 64 * 1024;
+  const PROBE_TIMEOUT_SEC = 40;
+
+  function recordProbe(name, value) {
+    const flags = loadEnvFlags();
+    const probe = flags.afterDone && typeof flags.afterDone === "object" ? flags.afterDone : {};
+    probe[name] = value;
+    probe.updatedAt = Date.now();
+    flags.afterDone = probe;
+    saveEnvFlags(flags);
+  }
+
+  // 发一个探针请求。onCallback 记下真正的回调什么时候到，哪怕这边已经按超时判负了。
+  function probeRequest(name, url, headers, timeoutSec) {
+    const sentAt = Date.now();
+    recordProbe(name, { state: "sent" });
+    return env.httpGet({
+      url: url,
+      headers: headers,
+      timeoutSec: timeoutSec,
+      onCallback: function (error, ms) {
+        recordProbe(name + "Callback", { ms: ms, ok: !error, error: error ? env.safeString(error).slice(0, 80) : "" });
+      }
+    }).then(function (response) {
+      const bytes = response.body ? response.body.length : 0;
+      const ok = (response.status === 206 || response.status === 200) && bytes > 0;
+      recordProbe(name, { state: ok ? "ok" : "http", status: response.status, bytes: bytes, ms: Date.now() - sentAt });
+    }, function (error) {
+      recordProbe(name, { state: "failed", ms: Date.now() - sentAt, error: env.safeString(error).slice(0, 100) });
+    });
+  }
+
   function probeAfterDone() {
     const lastMedia = loadLastMedia();
     if (!lastMedia) return htmlResponse("<!doctype html><meta charset=utf-8><p>还没有可用的视频地址，先播放一个视频。<a href=\"/\">返回</a></p>");
-    const flags = loadEnvFlags();
-    const startedAt = Date.now();
-    flags.afterDone = { state: "pending", startedAt };
-    saveEnvFlags(flags);
-    const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1" };
-    if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
+    const settings = loadSettings();
     const parts = core.parseUrl(lastMedia.url);
-    const hostList = core.candidateHosts(parts.host, loadSettings());
+    const hostList = core.candidateHosts(parts.host, settings);
     const host = hostList.indexOf(parts.host) >= 0 ? parts.host : hostList[0];
-    // 故意不 await：先让 main 把页面交出去。
-    BTR.accelerator.probeHost(lastMedia.url, host, headers, 64 * 1024, 15, null, 1).then(function (result) {
-      const latest = loadEnvFlags();
-      latest.afterDone = { state: result.ok ? "ok" : "failed", startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, host, error: result.error || "" };
-      saveEnvFlags(latest);
-    }, function (error) {
-      const latest = loadEnvFlags();
-      latest.afterDone = { state: "failed", startedAt, finishedAt: Date.now(), host, error: env.safeString(error).slice(0, 120) };
-      saveEnvFlags(latest);
+    const url = core.buildUrl(parts, host === parts.host ? {} : { host: host, port: "" });
+    const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1", Range: "bytes=0-" + (PROBE_BYTES - 1) };
+    if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
+    const startedAt = Date.now();
+    saveEnvFlags(Object.assign(loadEnvFlags(), {
+      afterDone: { version: BTR.VERSION, host: host, startedAt: startedAt, updatedAt: startedAt }
+    }));
+    // 先跑一次普通请求，跑完再交页面：它成功了，后面两项收不到回调才说明问题在环境。
+    return probeRequest("control", url, headers, 6).then(function () {
+      probeRequest("pending", url, headers, PROBE_TIMEOUT_SEC);
+      if (env.api.setTimeout) {
+        env.api.setTimeout(function () { probeRequest("delayed", url, headers, PROBE_TIMEOUT_SEC); }, 1500);
+        env.api.setTimeout(function () { recordProbe("timer", { state: "ok", ms: Date.now() - startedAt }); }, 25000);
+      } else {
+        recordProbe("timer", { state: "missing" });
+      }
+      return htmlResponse(renderProbePage(host));
     });
-    return htmlResponse("<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>预取实验</title>"
-      + "<style>body{margin:0;padding:16px;font:15px/1.6 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}.card{background:#fff;border-radius:12px;padding:14px 16px;margin:12px 0}code{background:#f1f2f3;padding:1px 4px;border-radius:4px}a{color:#fb7299}</style></head><body>"
-      + "<h1 style=\"font-size:20px\">预取实验</h1><div class=card>脚本已经把这个页面交出去了，同时向 <code>" + escapeHtml(host) + "</code> 发了一个 64 KiB 的请求。如果 Shadowrocket 允许脚本在 <code>$done</code> 之后继续跑完请求，下面几秒内会变成“成功”；一直停在“等待”就说明不允许，预取方案走不通。</div>"
-      + "<div class=card id=result>等待回调…</div><div><a href=\"/\">← 返回设置</a></div>"
-      + "<script>(function(){var box=document.getElementById('result');var tries=0;function poll(){fetch('/probe/after-done/result',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){if(d.state==='ok'){box.textContent='成功：$done 之后的请求在 '+d.elapsedMs+' ms 后回来了（节点 '+d.host+'）。预取方案可行。';return;}if(d.state==='failed'){box.textContent='请求回来了但失败：'+(d.error||'')+'。至少说明回调还在跑。';return;}tries++;box.textContent='等待回调… '+tries*2+' 秒';if(tries<15)setTimeout(poll,2000);else box.textContent='30 秒内没有任何回调：Shadowrocket 在 $done 之后就停掉了脚本，预取方案走不通。';}).catch(function(e){box.textContent='读取结果失败：'+e;});}setTimeout(poll,2000);})();</script></body></html>");
+  }
+
+  function renderProbePage(host) {
+    return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>预取实验</title>"
+      + "<style>body{margin:0;padding:16px;font:15px/1.6 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}.card{background:#fff;border-radius:12px;padding:14px 16px;margin:12px 0}code{background:#f1f2f3;padding:1px 4px;border-radius:4px}a{color:#fb7299}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:6px 4px;border-bottom:1px solid #eee;vertical-align:top}th{color:#61666d;font-weight:500;white-space:nowrap}.v{font-weight:600}</style></head><body>"
+      + "<h1 style=\"font-size:20px\">预取实验</h1>"
+      + "<div class=card>脚本正在对 <code>" + escapeHtml(host) + "</code> 发四个探针，全部只取 64 KiB。对照那一发在交出页面之前就跑完了；另外两发的回调落在 <code>$done</code> 之后。它们要是都收不到回调，预取就走不通。最多等一分钟。</div>"
+      + "<div class=card id=verdict>正在测…</div>"
+      + "<div class=card><table id=rows><tr><th>探针</th><th>结果</th></tr></table></div>"
+      + "<div><a href=\"/\">← 返回设置</a></div>"
+      + "<script>(function(){"
+      + "var names={control:'对照（交页面之前跑完）',pending:'$done 之后回调',delayed:'$done 之后发出',timer:'25 秒定时器'};"
+      + "var order=['control','pending','delayed','timer'];"
+      + "var verdict=document.getElementById('verdict');var rows=document.getElementById('rows');var tries=0;"
+      + "function cell(d,key){var it=d[key];var cb=d[key+'Callback'];if(!it)return'未开始';"
+      + "var text=it.state==='ok'?('成功 '+(it.ms!=null?it.ms+' ms':'')+(it.bytes?('，'+it.bytes+' 字节'):'')):"
+      + "it.state==='sent'?'已发出，还没回来':"
+      + "it.state==='http'?('回来了但不是分片：HTTP '+it.status):"
+      + "it.state==='failed'?('失败：'+(it.error||'')):it.state;"
+      + "if(cb)text+='（真回调 '+cb.ms+' ms 到）';return text;}"
+      + "function render(d){var html='<tr><th>探针</th><th>结果</th></tr>';"
+      + "order.forEach(function(k){html+='<tr><th>'+names[k]+'</th><td>'+cell(d,k)+'</td></tr>';});rows.innerHTML=html;"
+      + "var c=d.control||{},p=d.pending||{},l=d.delayed||{};"
+      + "if(c.state&&c.state!=='ok'&&c.state!=='sent'){verdict.innerHTML='<span class=v>实验无效</span>：对照那一发就没成，这个节点现在连不上，换个节点或重新播放一段视频再试。';return true;}"
+      + "if(p.state==='ok'||l.state==='ok'){verdict.innerHTML='<span class=v>预取可行</span>：脚本在交出页面之后仍然能把请求跑完。';return true;}"
+      + "if(tries>=20){verdict.innerHTML='<span class=v>预取走不通</span>：对照那一发'+(c.ms?('只用了 '+c.ms+' ms'):'成功了')+'，但交出页面之后的两发都没有回调'+((d.timer&&d.timer.state==='ok')?'（定时器却照常在跑，说明脚本还活着，只是网络被停了）':'')+'。';return true;}"
+      + "return false;}"
+      + "function poll(){fetch('/probe/after-done/result',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){tries++;if(render(d))return;setTimeout(poll,3000);})"
+      + ".catch(function(e){verdict.textContent='读取结果失败：'+e;});}"
+      + "setTimeout(poll,1500);})();</script></body></html>";
   }
 
   function htmlResponse(body, status) {
@@ -1471,12 +1568,18 @@ const BTR = { VERSION: "0.2.1" };
       message = saveSettings(next) ? "设置已保存。" : "设置保存失败：这个环境没有可用的 $persistentStore。";
     } else if (path === "/reset") {
       const what = query.what || "";
+      // “全部重置”连设置一起恢复默认，不然线程数、每块大小这些会留着上次存的值。
+      if (what === "settings" || what === "all") env.store.writeJson(SETTINGS_KEY, { revision: SETTINGS_REVISION });
       if (what === "stats" || what === "all") saveStats(emptyStats());
       if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
       if (what === "env" || what === "all") saveEnvFlags({});
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
-      if (what === "all") { env.store.writeJson(LAST_MEDIA_KEY, {}); env.store.writeJson(INFLIGHT_KEY, {}); }
-      message = what ? "已重置：" + what + "。" : "没有指定要重置什么。";
+      if (what === "all") {
+        env.store.writeJson(LAST_MEDIA_KEY, {});
+        env.store.writeJson(INFLIGHT_KEY, {});
+        env.store.writeJson(BUSY_KEY, {});
+      }
+      message = RESET_LABELS[what] ? "已重置：" + RESET_LABELS[what] + "。" : "没有指定要重置什么。";
     } else if (path === "/diag.json") {
       return jsonResponse({
         version: BTR.VERSION,
@@ -1619,14 +1722,18 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
     const runId = String(startedAtOf(entry)) + Math.random().toString(36).slice(2, 7);
-    const wantedPieces = Math.min(settings.threads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
+    // 刚被节点以 412 / 429 顶回来过，就先收着劲跑：线程数减半，三分钟后恢复。
+    const pushbackLeft = accelerator.pushbackMs(health);
+    if (pushbackLeft) entry.pushback = Math.round(pushbackLeft / 1000);
+    const wantThreads = pushbackLeft ? Math.max(2, Math.ceil(settings.threads / 2)) : settings.threads;
+    const wantedPieces = Math.min(wantThreads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
     const reserved = settingsModule.reserveBusy(runId, wantedPieces + 2);
     if (reserved.granted < 2) {
       settingsModule.releaseInflight(inflightKey);
       entry.busy = reserved.used;
       return single("busy");
     }
-    const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(settings.threads, reserved.granted - 1)) } });
+    const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(wantThreads, reserved.granted - 1)) } });
     try {
       const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
       settingsModule.releaseBusy(runId);
@@ -1721,7 +1828,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
+      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "")
       : entry.rewrittenTo || entry.error || "";
     env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }

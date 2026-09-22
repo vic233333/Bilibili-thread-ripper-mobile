@@ -137,6 +137,9 @@
         return;
       }
       const timeoutSec = Math.max(1, Number(options.timeoutSec) || 8);
+      // 真正的回调什么时候到（哪怕已经超时判负了）：预取实验要靠它判断 $done 之后请求还跑不跑。
+      const onCallback = typeof options.onCallback === "function" ? options.onCallback : null;
+      const sentAt = Date.now();
       let settled = false;
       let timer = null;
       const finish = function (callback, value) {
@@ -158,6 +161,9 @@
       };
       try {
         api.httpClient.get(request, function (error, response, data) {
+          if (onCallback) {
+            try { onCallback(error || null, Date.now() - sentAt, response); } catch (_error) {}
+          }
           if (error) {
             finish(reject, wrapError(error));
             return;

@@ -75,14 +75,18 @@
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
     const runId = String(startedAtOf(entry)) + Math.random().toString(36).slice(2, 7);
-    const wantedPieces = Math.min(settings.threads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
+    // 刚被节点以 412 / 429 顶回来过，就先收着劲跑：线程数减半，三分钟后恢复。
+    const pushbackLeft = accelerator.pushbackMs(health);
+    if (pushbackLeft) entry.pushback = Math.round(pushbackLeft / 1000);
+    const wantThreads = pushbackLeft ? Math.max(2, Math.ceil(settings.threads / 2)) : settings.threads;
+    const wantedPieces = Math.min(wantThreads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
     const reserved = settingsModule.reserveBusy(runId, wantedPieces + 2);
     if (reserved.granted < 2) {
       settingsModule.releaseInflight(inflightKey);
       entry.busy = reserved.used;
       return single("busy");
     }
-    const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(settings.threads, reserved.granted - 1)) } });
+    const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(wantThreads, reserved.granted - 1)) } });
     try {
       const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
       settingsModule.releaseBusy(runId);
@@ -177,7 +181,7 @@
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
+      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "")
       : entry.rewrittenTo || entry.error || "";
     env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }
