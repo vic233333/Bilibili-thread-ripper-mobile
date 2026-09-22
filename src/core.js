@@ -129,6 +129,8 @@
     return Math.min(max, Math.max(min, number));
   }
 
+  const OVERFETCH_OPTIONS = [0, 1, 2, 4];
+
   function normalizeSettings(input) {
     const source = input && typeof input === "object" ? input : {};
     const threads = Math.trunc(Number(source.threads));
@@ -155,13 +157,18 @@
       swapSingle: source.swapSingle !== false,
       // 子请求沿用原地址的协议（App 是明文 http），也可以强制走 https。
       subrequestScheme: source.subrequestScheme === "https" ? "https" : "keep",
+      // 超量回传（实验）：App 要 1 MiB，就多下几 MiB 一起回给它。代理没法像浏览器版那样
+      // 提前预读（真机验证：脚本交出响应之后，它发出的请求再也不会有回调），能做的只有
+      // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
+      overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 6)),
       deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 20)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },
       // 比两块还小的区间拆了也没意义。
-      get minSplitBytes() { return this.minChunkKiB * 1024 * 2; }
+      get minSplitBytes() { return this.minChunkKiB * 1024 * 2; },
+      get overfetchBytes() { return this.overfetchMiB * 1024 * 1024; }
     };
   }
 
@@ -217,6 +224,7 @@
   }
 
   BTR.core = Object.freeze({
+    OVERFETCH_OPTIONS,
     MAINLAND_HOSTS,
     OVERSEAS_HOSTS,
     THREAD_OPTIONS,

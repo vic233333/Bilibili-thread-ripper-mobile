@@ -87,6 +87,61 @@ test("一个节点返回 403 时，这块换别的节点重试，整段仍然成
   assert.equal(server.requestsFor("upos-sz-mirrorali.bilivideo.com").length, 0, "退避中的节点不该再被分到块");
 });
 
+const MEDIA_PATH = "/upgcxcode/12/34/123456/123456-1-30080.m4s";
+
+function fastHistory(count) {
+  return {
+    since: Date.now(), seen: count, accelerated: count, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, schemes: {},
+    recent: Array.from({ length: count }, () => ({ result: "accelerated", length: 1048576, elapsedMs: 100 }))
+  };
+}
+
+test("超量回传：知道文件多大、速度也够时，多下一段一起交给播放器", async () => {
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8, overfetchMiB: 1 });
+  store.setJson("btr.sizes", { [MEDIA_PATH]: { total: server.size, at: Date.now() } });
+  store.setJson("btr.stats", fastHistory(3));
+  const env = createEnv({ server, store });
+  const { value } = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.equal(value.response.status, 206);
+  assert.equal(value.response.headers["Content-Range"], `bytes 0-2097151/${server.size}`, "回给播放器的区间要比它问的大一段");
+  assert.equal(value.response.headers["Content-Length"], String(2 * 1024 * 1024));
+  assert.ok(Buffer.from(value.response.body).equals(expected(0, 2097151)), "多出来的那段字节也要对");
+  assert.equal(store.json("btr.stats").recent[0].overfetch, 1048576);
+});
+
+test("超量回传的三道闸：不知道文件多大、速度不够、越过文件末尾", async () => {
+  const base = { revision: 3, mode: "mainland", threads: 8, overfetchMiB: 4 };
+
+  // 还没拼过这个文件，不知道总长：照常只回它问的那一段，并把总长记下来备用。
+  const first = createStore();
+  first.setJson("btr.settings", base);
+  first.setJson("btr.stats", fastHistory(3));
+  const cold = createEnv({ server, store: first });
+  const one = await cold.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.equal(one.value.response.headers["Content-Range"], `bytes 0-1048575/${server.size}`);
+  assert.equal(first.json("btr.sizes")[MEDIA_PATH].total, server.size, "拼完应当记住文件多大");
+
+  // 最近几次都很慢：多给一段来不及，就别给。
+  const slow = createStore();
+  slow.setJson("btr.settings", base);
+  slow.setJson("btr.sizes", { [MEDIA_PATH]: { total: server.size, at: Date.now() } });
+  slow.setJson("btr.stats", Object.assign(fastHistory(3), {
+    recent: Array.from({ length: 3 }, () => ({ result: "accelerated", length: 1048576, elapsedMs: 3000 }))
+  }));
+  const tired = await createEnv({ server, store: slow }).run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.equal(tired.value.response.headers["Content-Range"], `bytes 0-1048575/${server.size}`);
+
+  // 贴着文件末尾：多出来的那截会被夹到最后一个字节，不会越界。
+  const tail = createStore();
+  tail.setJson("btr.settings", base);
+  tail.setJson("btr.sizes", { [MEDIA_PATH]: { total: server.size, at: Date.now() } });
+  tail.setJson("btr.stats", fastHistory(3));
+  const near = await createEnv({ server, store: tail }).run(mediaRequest({ headers: { Range: `bytes=2097152-3145727` } }));
+  assert.equal(near.value.response.headers["Content-Range"], `bytes 2097152-${server.size - 1}/${server.size}`);
+  assert.ok(Buffer.from(near.value.response.body).equals(expected(2097152, server.size - 1)));
+});
+
 test("节点回 412 是限流不是拒绝：只短暂退避，下一段的线程数减半", async () => {
   server.setBehavior("upos-sz-mirrorali.bilivideo.com", { status: 412 });
   const store = createStore();

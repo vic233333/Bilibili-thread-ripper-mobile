@@ -52,6 +52,24 @@
     };
   }
 
+  // 多给一段要在这次请求里下完，所以估算的时间得留足余量：App 等不到三秒就会重发同一段。
+  const OVERFETCH_BUDGET_MS = 2200;
+
+  function overfetchTarget(parts, range, settings, health, entry) {
+    const extra = settings.overfetchBytes;
+    if (!extra) return range;
+    if (accelerator.pushbackMs(health)) return range;
+    const total = settingsModule.knownTotal(parts.path);
+    if (!total) return range;
+    const end = Math.min(range.end + extra, total - 1, range.start + settings.maxBytes - 1);
+    if (end <= range.end) return range;
+    const length = end - range.start + 1;
+    const bps = settingsModule.recentBps(settingsModule.loadStats());
+    if (!bps || length / bps * 1000 > OVERFETCH_BUDGET_MS) return range;
+    entry.overfetch = end - range.end;
+    return { kind: "bounded", raw: range.raw, start: range.start, end, length };
+  }
+
   async function decide(parts, method, headers, settings, entry) {
     if (!settings.enabled) return pass("disabled");
     if (method !== "GET") return pass("notGet");
@@ -71,6 +89,9 @@
     if (range.kind !== "bounded") return single(range.kind === "none" ? "noRange" : range.kind === "open" ? "openRange" : "unsupportedRange");
     if (range.length > settings.maxBytes) return single("tooLarge");
     if (range.length < settings.minSplitBytes) return single("tooSmall");
+    // 超量回传（实验）：多下一段一起交给 App。只在三件事都成立时才做——文件总长已知
+    // （多出来的那截不能越过文件末尾）、最近几次的实测速度撑得住、不在限流中。
+    const target = overfetchTarget(parts, range, settings, health, entry);
     const inflightKey = parts.path + "#" + range.start + "-" + range.end;
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
@@ -79,7 +100,7 @@
     const pushbackLeft = accelerator.pushbackMs(health);
     if (pushbackLeft) entry.pushback = Math.round(pushbackLeft / 1000);
     const wantThreads = pushbackLeft ? Math.max(2, Math.ceil(settings.threads / 2)) : settings.threads;
-    const wantedPieces = Math.min(wantThreads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
+    const wantedPieces = Math.min(wantThreads, Math.max(1, Math.ceil(target.length / settings.minChunkBytes)));
     const reserved = settingsModule.reserveBusy(runId, wantedPieces + 2);
     if (reserved.granted < 2) {
       settingsModule.releaseInflight(inflightKey);
@@ -88,7 +109,7 @@
     }
     const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(wantThreads, reserved.granted - 1)) } });
     try {
-      const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
+      const download = await accelerator.downloadRange({ parts, range: target, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
       settingsModule.releaseBusy(runId);
       settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
@@ -98,10 +119,14 @@
       entry.hedges = download.hedges;
       entry.pieceMsMin = download.pieceMsMin;
       entry.pieceMsMax = download.pieceMsMax;
+      // 实际交出去多少字节：超量回传时比 App 问的那一段大，速度统计要按真实的量算。
+      entry.delivered = target.length;
+      // 文件总长只有从分片响应的 Content-Range 才知道，记下来给下一次的超量回传用。
+      if (download.total) settingsModule.rememberTotal(parts.path, download.total);
       const responseHeaders = {
         "Content-Type": download.contentType || "video/mp4",
-        "Content-Range": "bytes " + range.start + "-" + range.end + "/" + (download.total === null ? "*" : download.total),
-        "Content-Length": String(range.length),
+        "Content-Range": "bytes " + target.start + "-" + target.end + "/" + (download.total === null ? "*" : download.total),
+        "Content-Length": String(target.length),
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-store",
         "X-BTR": BTR.VERSION + "; pieces=" + download.pieces + "; hosts=" + Object.keys(download.usage).length + "; ms=" + download.elapsedMs
@@ -183,7 +208,7 @@
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "")
+      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "") + (entry.overfetch ? " 多给 " + Math.round(entry.overfetch / 1024) + "KiB" : "")
       : entry.rewrittenTo || entry.error || "";
     env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }

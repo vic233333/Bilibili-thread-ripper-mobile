@@ -40,6 +40,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
     threads: 4,
     maxMiB: 12,
     minChunkKiB: 512,
+    overfetchMiB: 0,
     swapSingle: false,
     subrequestScheme: "https",
     attemptTimeoutSec: 6,

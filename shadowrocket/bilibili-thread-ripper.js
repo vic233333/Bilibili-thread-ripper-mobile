@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.2.4
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.3.0
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.2.4" };
+const BTR = { VERSION: "0.3.0" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -145,6 +145,8 @@ const BTR = { VERSION: "0.2.4" };
     return Math.min(max, Math.max(min, number));
   }
 
+  const OVERFETCH_OPTIONS = [0, 1, 2, 4];
+
   function normalizeSettings(input) {
     const source = input && typeof input === "object" ? input : {};
     const threads = Math.trunc(Number(source.threads));
@@ -171,13 +173,18 @@ const BTR = { VERSION: "0.2.4" };
       swapSingle: source.swapSingle !== false,
       // 子请求沿用原地址的协议（App 是明文 http），也可以强制走 https。
       subrequestScheme: source.subrequestScheme === "https" ? "https" : "keep",
+      // 超量回传（实验）：App 要 1 MiB，就多下几 MiB 一起回给它。代理没法像浏览器版那样
+      // 提前预读（真机验证：脚本交出响应之后，它发出的请求再也不会有回调），能做的只有
+      // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
+      overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 6)),
       deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 20)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },
       // 比两块还小的区间拆了也没意义。
-      get minSplitBytes() { return this.minChunkKiB * 1024 * 2; }
+      get minSplitBytes() { return this.minChunkKiB * 1024 * 2; },
+      get overfetchBytes() { return this.overfetchMiB * 1024 * 1024; }
     };
   }
 
@@ -233,6 +240,7 @@ const BTR = { VERSION: "0.2.4" };
   }
 
   BTR.core = Object.freeze({
+    OVERFETCH_OPTIONS,
     MAINLAND_HOSTS,
     OVERSEAS_HOSTS,
     THREAD_OPTIONS,
@@ -973,6 +981,7 @@ const BTR = { VERSION: "0.2.4" };
       threads: settings.threads,
       maxMiB: settings.maxMiB,
       minChunkKiB: settings.minChunkKiB,
+      overfetchMiB: settings.overfetchMiB,
       swapSingle: settings.swapSingle,
       subrequestScheme: settings.subrequestScheme,
       attemptTimeoutSec: settings.attemptTimeoutSec,
@@ -997,6 +1006,34 @@ const BTR = { VERSION: "0.2.4" };
 
   function saveStats(stats) {
     return env.store.writeJson(STATS_KEY, stats);
+  }
+
+  // 记下每个文件有多大：超量回传要把多下的那一段夹在文件末尾以内，而文件总长只有在
+  // 第一次拼完分片、读到 Content-Range 的 /total 时才知道。只留最近几个文件。
+  const SIZES_KEY = "btr.sizes";
+  const SIZES_LIMIT = 6;
+  const SIZES_TTL_MS = 6 * 60 * 60 * 1000;
+
+  function loadSizes() {
+    const stored = env.store.readJson(SIZES_KEY, null);
+    return stored && typeof stored === "object" ? stored : {};
+  }
+
+  function knownTotal(path) {
+    const item = loadSizes()[path];
+    if (!item || Date.now() - (Number(item.at) || 0) > SIZES_TTL_MS) return 0;
+    return Number(item.total) || 0;
+  }
+
+  function rememberTotal(path, total) {
+    const size = Number(total) || 0;
+    if (!path || size <= 0) return false;
+    const sizes = loadSizes();
+    sizes[path] = { total: size, at: Date.now() };
+    const keys = Object.keys(sizes).sort(function (a, b) { return (Number(sizes[b].at) || 0) - (Number(sizes[a].at) || 0); });
+    const kept = {};
+    keys.slice(0, SIZES_LIMIT).forEach(function (key) { kept[key] = sizes[key]; });
+    return env.store.writeJson(SIZES_KEY, kept);
   }
 
   function loadBeat() {
@@ -1024,7 +1061,7 @@ const BTR = { VERSION: "0.2.4" };
   const STORE_KEYS = [
     ["btr.settings", "设置"], ["btr.stats", "统计"], ["btr.health", "节点记忆"], ["btr.log", "日志"],
     ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"],
-    ["btr.lastMedia", "测速用地址"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
+    ["btr.lastMedia", "测速用地址"], ["btr.sizes", "文件大小记忆"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
   ];
 
   function storeSelfTest() {
@@ -1054,7 +1091,7 @@ const BTR = { VERSION: "0.2.4" };
     }
     if (entry.result === "accelerated") {
       stats.accelerated += 1;
-      stats.bytes += Number(entry.length) || 0;
+      stats.bytes += Number(entry.delivered) || Number(entry.length) || 0;
       stats.elapsedMs += Number(entry.elapsedMs) || 0;
     } else if (entry.result === "rewritten") {
       stats.rewritten += 1;
@@ -1064,6 +1101,18 @@ const BTR = { VERSION: "0.2.4" };
     }
     stats.recent.unshift(entry);
     if (stats.recent.length > RECENT_LIMIT) stats.recent.length = RECENT_LIMIT;
+  }
+
+  // 最近几次多线程请求的实测速度（字节每秒）。超量回传靠它估算“多给这么多还来不来得及”，
+  // 用实测而不是单节点的理论速度，因为实测里已经含上了拆块、握手和副本的代价。
+  function recentBps(stats, samples) {
+    const list = (stats && Array.isArray(stats.recent) ? stats.recent : [])
+      .filter(function (item) { return item && item.result === "accelerated" && Number(item.delivered || item.length) > 0 && Number(item.elapsedMs) > 0; })
+      .slice(0, samples || 5);
+    if (list.length < 2) return 0;
+    const bytes = list.reduce(function (sum, item) { return sum + Number(item.delivered || item.length); }, 0);
+    const ms = list.reduce(function (sum, item) { return sum + Number(item.elapsedMs); }, 0);
+    return ms > 0 ? bytes * 1000 / ms : 0;
   }
 
   function loadLog() {
@@ -1234,6 +1283,7 @@ const BTR = { VERSION: "0.2.4" };
       threads: Number(query.threads),
       maxMiB: Number(query.maxMiB),
       minChunkKiB: Number(query.minChunkKiB),
+      overfetchMiB: Number(query.overfetchMiB),
       swapSingle: truthy(query.swapSingle),
       subrequestScheme: query.subrequestScheme,
       attemptTimeoutSec: Number(query.attemptTimeoutSec),
@@ -1417,6 +1467,9 @@ const BTR = { VERSION: "0.2.4" };
       + "</select></label>"
       + "<label class=row><span>单个分片上限 (MiB)<small>整个分片要先在内存里拼好，超过就不拆</small></span><input type=number name=maxMiB min=2 max=24 step=1 value=" + settings.maxMiB + "></label>"
       + "<label class=row><span>每块最小 (KiB)<small>块太小时请求往返占大头</small></span><input type=number name=minChunkKiB min=64 max=1024 step=64 value=" + settings.minChunkKiB + "></label>"
+      + "<label class=row><span>超量回传（实验）<small>App 要 1 MiB，就多下这么多一起交给它。真机已验证脚本交出响应之后发不出请求，预读只能这样做；播放器不认就会卡住或花屏，遇到就调回“关”</small></span><select name=overfetchMiB>"
+      + core.OVERFETCH_OPTIONS.map(function (value) { return "<option value=" + value + selected(settings.overfetchMiB === value) + ">" + (value ? "多给 " + value + " MiB" : "关") + "</option>"; }).join("")
+      + "</select></label>"
       + "<label class=row><span>不拆分的请求也换节点<small>没有 Range、开区间或太大太小的请求，单连接改走当前模式最快的节点</small></span><input type=checkbox name=swapSingle value=1" + checked(settings.swapSingle) + "></label>"
       + "<label class=row><span>子请求协议<small>App 的分片是明文 http；有些网络对 http 干扰大时可以试 https</small></span><select name=subrequestScheme>"
       + "<option value=keep" + selected(settings.subrequestScheme === "keep") + ">跟原地址一样</option>"
@@ -1693,6 +1746,7 @@ const BTR = { VERSION: "0.2.4" };
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
       if (what === "all") {
         env.store.writeJson(LAST_MEDIA_KEY, {});
+        env.store.writeJson(SIZES_KEY, {});
         env.store.writeJson(INFLIGHT_KEY, {});
         env.store.writeJson(BUSY_KEY, {});
         env.store.writeJson(BEAT_KEY, {});
@@ -1745,8 +1799,11 @@ const BTR = { VERSION: "0.2.4" };
     GLOBAL_INFLIGHT_LIMIT,
     appendLog,
     claimInflight,
+    knownTotal,
     loadBeat,
+    recentBps,
     recordBeat,
+    rememberTotal,
     loadBusy,
     releaseBusy,
     reserveBusy,
@@ -1825,6 +1882,24 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     };
   }
 
+  // 多给一段要在这次请求里下完，所以估算的时间得留足余量：App 等不到三秒就会重发同一段。
+  const OVERFETCH_BUDGET_MS = 2200;
+
+  function overfetchTarget(parts, range, settings, health, entry) {
+    const extra = settings.overfetchBytes;
+    if (!extra) return range;
+    if (accelerator.pushbackMs(health)) return range;
+    const total = settingsModule.knownTotal(parts.path);
+    if (!total) return range;
+    const end = Math.min(range.end + extra, total - 1, range.start + settings.maxBytes - 1);
+    if (end <= range.end) return range;
+    const length = end - range.start + 1;
+    const bps = settingsModule.recentBps(settingsModule.loadStats());
+    if (!bps || length / bps * 1000 > OVERFETCH_BUDGET_MS) return range;
+    entry.overfetch = end - range.end;
+    return { kind: "bounded", raw: range.raw, start: range.start, end, length };
+  }
+
   async function decide(parts, method, headers, settings, entry) {
     if (!settings.enabled) return pass("disabled");
     if (method !== "GET") return pass("notGet");
@@ -1844,6 +1919,9 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     if (range.kind !== "bounded") return single(range.kind === "none" ? "noRange" : range.kind === "open" ? "openRange" : "unsupportedRange");
     if (range.length > settings.maxBytes) return single("tooLarge");
     if (range.length < settings.minSplitBytes) return single("tooSmall");
+    // 超量回传（实验）：多下一段一起交给 App。只在三件事都成立时才做——文件总长已知
+    // （多出来的那截不能越过文件末尾）、最近几次的实测速度撑得住、不在限流中。
+    const target = overfetchTarget(parts, range, settings, health, entry);
     const inflightKey = parts.path + "#" + range.start + "-" + range.end;
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
@@ -1852,7 +1930,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     const pushbackLeft = accelerator.pushbackMs(health);
     if (pushbackLeft) entry.pushback = Math.round(pushbackLeft / 1000);
     const wantThreads = pushbackLeft ? Math.max(2, Math.ceil(settings.threads / 2)) : settings.threads;
-    const wantedPieces = Math.min(wantThreads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
+    const wantedPieces = Math.min(wantThreads, Math.max(1, Math.ceil(target.length / settings.minChunkBytes)));
     const reserved = settingsModule.reserveBusy(runId, wantedPieces + 2);
     if (reserved.granted < 2) {
       settingsModule.releaseInflight(inflightKey);
@@ -1861,7 +1939,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     }
     const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(wantThreads, reserved.granted - 1)) } });
     try {
-      const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
+      const download = await accelerator.downloadRange({ parts, range: target, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
       settingsModule.releaseBusy(runId);
       settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
@@ -1871,10 +1949,14 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       entry.hedges = download.hedges;
       entry.pieceMsMin = download.pieceMsMin;
       entry.pieceMsMax = download.pieceMsMax;
+      // 实际交出去多少字节：超量回传时比 App 问的那一段大，速度统计要按真实的量算。
+      entry.delivered = target.length;
+      // 文件总长只有从分片响应的 Content-Range 才知道，记下来给下一次的超量回传用。
+      if (download.total) settingsModule.rememberTotal(parts.path, download.total);
       const responseHeaders = {
         "Content-Type": download.contentType || "video/mp4",
-        "Content-Range": "bytes " + range.start + "-" + range.end + "/" + (download.total === null ? "*" : download.total),
-        "Content-Length": String(range.length),
+        "Content-Range": "bytes " + target.start + "-" + target.end + "/" + (download.total === null ? "*" : download.total),
+        "Content-Length": String(target.length),
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-store",
         "X-BTR": BTR.VERSION + "; pieces=" + download.pieces + "; hosts=" + Object.keys(download.usage).length + "; ms=" + download.elapsedMs
@@ -1956,7 +2038,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "")
+      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "") + (entry.pushback ? " 限流中 " + entry.pushback + "s" : "") + (entry.overfetch ? " 多给 " + Math.round(entry.overfetch / 1024) + "KiB" : "")
       : entry.rewrittenTo || entry.error || "";
     env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }

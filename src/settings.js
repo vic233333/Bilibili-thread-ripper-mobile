@@ -70,6 +70,7 @@
       threads: settings.threads,
       maxMiB: settings.maxMiB,
       minChunkKiB: settings.minChunkKiB,
+      overfetchMiB: settings.overfetchMiB,
       swapSingle: settings.swapSingle,
       subrequestScheme: settings.subrequestScheme,
       attemptTimeoutSec: settings.attemptTimeoutSec,
@@ -94,6 +95,34 @@
 
   function saveStats(stats) {
     return env.store.writeJson(STATS_KEY, stats);
+  }
+
+  // 记下每个文件有多大：超量回传要把多下的那一段夹在文件末尾以内，而文件总长只有在
+  // 第一次拼完分片、读到 Content-Range 的 /total 时才知道。只留最近几个文件。
+  const SIZES_KEY = "btr.sizes";
+  const SIZES_LIMIT = 6;
+  const SIZES_TTL_MS = 6 * 60 * 60 * 1000;
+
+  function loadSizes() {
+    const stored = env.store.readJson(SIZES_KEY, null);
+    return stored && typeof stored === "object" ? stored : {};
+  }
+
+  function knownTotal(path) {
+    const item = loadSizes()[path];
+    if (!item || Date.now() - (Number(item.at) || 0) > SIZES_TTL_MS) return 0;
+    return Number(item.total) || 0;
+  }
+
+  function rememberTotal(path, total) {
+    const size = Number(total) || 0;
+    if (!path || size <= 0) return false;
+    const sizes = loadSizes();
+    sizes[path] = { total: size, at: Date.now() };
+    const keys = Object.keys(sizes).sort(function (a, b) { return (Number(sizes[b].at) || 0) - (Number(sizes[a].at) || 0); });
+    const kept = {};
+    keys.slice(0, SIZES_LIMIT).forEach(function (key) { kept[key] = sizes[key]; });
+    return env.store.writeJson(SIZES_KEY, kept);
   }
 
   function loadBeat() {
@@ -121,7 +150,7 @@
   const STORE_KEYS = [
     ["btr.settings", "设置"], ["btr.stats", "统计"], ["btr.health", "节点记忆"], ["btr.log", "日志"],
     ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"],
-    ["btr.lastMedia", "测速用地址"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
+    ["btr.lastMedia", "测速用地址"], ["btr.sizes", "文件大小记忆"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
   ];
 
   function storeSelfTest() {
@@ -151,7 +180,7 @@
     }
     if (entry.result === "accelerated") {
       stats.accelerated += 1;
-      stats.bytes += Number(entry.length) || 0;
+      stats.bytes += Number(entry.delivered) || Number(entry.length) || 0;
       stats.elapsedMs += Number(entry.elapsedMs) || 0;
     } else if (entry.result === "rewritten") {
       stats.rewritten += 1;
@@ -161,6 +190,18 @@
     }
     stats.recent.unshift(entry);
     if (stats.recent.length > RECENT_LIMIT) stats.recent.length = RECENT_LIMIT;
+  }
+
+  // 最近几次多线程请求的实测速度（字节每秒）。超量回传靠它估算“多给这么多还来不来得及”，
+  // 用实测而不是单节点的理论速度，因为实测里已经含上了拆块、握手和副本的代价。
+  function recentBps(stats, samples) {
+    const list = (stats && Array.isArray(stats.recent) ? stats.recent : [])
+      .filter(function (item) { return item && item.result === "accelerated" && Number(item.delivered || item.length) > 0 && Number(item.elapsedMs) > 0; })
+      .slice(0, samples || 5);
+    if (list.length < 2) return 0;
+    const bytes = list.reduce(function (sum, item) { return sum + Number(item.delivered || item.length); }, 0);
+    const ms = list.reduce(function (sum, item) { return sum + Number(item.elapsedMs); }, 0);
+    return ms > 0 ? bytes * 1000 / ms : 0;
   }
 
   function loadLog() {
@@ -331,6 +372,7 @@
       threads: Number(query.threads),
       maxMiB: Number(query.maxMiB),
       minChunkKiB: Number(query.minChunkKiB),
+      overfetchMiB: Number(query.overfetchMiB),
       swapSingle: truthy(query.swapSingle),
       subrequestScheme: query.subrequestScheme,
       attemptTimeoutSec: Number(query.attemptTimeoutSec),
@@ -514,6 +556,9 @@
       + "</select></label>"
       + "<label class=row><span>单个分片上限 (MiB)<small>整个分片要先在内存里拼好，超过就不拆</small></span><input type=number name=maxMiB min=2 max=24 step=1 value=" + settings.maxMiB + "></label>"
       + "<label class=row><span>每块最小 (KiB)<small>块太小时请求往返占大头</small></span><input type=number name=minChunkKiB min=64 max=1024 step=64 value=" + settings.minChunkKiB + "></label>"
+      + "<label class=row><span>超量回传（实验）<small>App 要 1 MiB，就多下这么多一起交给它。真机已验证脚本交出响应之后发不出请求，预读只能这样做；播放器不认就会卡住或花屏，遇到就调回“关”</small></span><select name=overfetchMiB>"
+      + core.OVERFETCH_OPTIONS.map(function (value) { return "<option value=" + value + selected(settings.overfetchMiB === value) + ">" + (value ? "多给 " + value + " MiB" : "关") + "</option>"; }).join("")
+      + "</select></label>"
       + "<label class=row><span>不拆分的请求也换节点<small>没有 Range、开区间或太大太小的请求，单连接改走当前模式最快的节点</small></span><input type=checkbox name=swapSingle value=1" + checked(settings.swapSingle) + "></label>"
       + "<label class=row><span>子请求协议<small>App 的分片是明文 http；有些网络对 http 干扰大时可以试 https</small></span><select name=subrequestScheme>"
       + "<option value=keep" + selected(settings.subrequestScheme === "keep") + ">跟原地址一样</option>"
@@ -790,6 +835,7 @@
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
       if (what === "all") {
         env.store.writeJson(LAST_MEDIA_KEY, {});
+        env.store.writeJson(SIZES_KEY, {});
         env.store.writeJson(INFLIGHT_KEY, {});
         env.store.writeJson(BUSY_KEY, {});
         env.store.writeJson(BEAT_KEY, {});
@@ -842,8 +888,11 @@
     GLOBAL_INFLIGHT_LIMIT,
     appendLog,
     claimInflight,
+    knownTotal,
     loadBeat,
+    recentBps,
     recordBeat,
+    rememberTotal,
     loadBusy,
     releaseBusy,
     reserveBusy,
