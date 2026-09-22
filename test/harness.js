@@ -121,10 +121,10 @@ function createEnv(options) {
       const expose = (BTR) => { exposed = BTR; };
       try {
         const factory = new Function(
-          "$request", "$done", "$httpClient", "$persistentStore", "$notification", "console", "setTimeout", "clearTimeout", "__BTR_EXPOSE__",
+          "$request", "$done", "$httpClient", "$persistentStore", "$notification", "console", "setTimeout", "clearTimeout", "__BTR_EXPOSE__", "$argument",
           loadBundle()
         );
-        factory(request, $done, $httpClient, $persistentStore, $notification, fakeConsole, strictSetTimeout, strictClearTimeout, expose);
+        factory(request, $done, $httpClient, $persistentStore, $notification, fakeConsole, strictSetTimeout, strictClearTimeout, expose, options.argument);
       } catch (error) {
         clearTimeout(timer);
         reject(error);

@@ -218,6 +218,70 @@ test("同一段还在拆的时候再来一份，只换节点不再拆；拆完�
   }
 });
 
+test("设置页显示模式徽标；https 版长时间只收到明文分片时提示检查解密与证书", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest, MEDIA_URL } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    // http 版：徽标写明文，没有提示。
+    let store = createStore();
+    let env = createEnv({ server, store, argument: "mode=http" });
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    let html = (await env.run(page("/"))).value.response.body;
+    assert.ok(html.includes("http 明文模式"));
+    assert.ok(!html.includes("没有收到任何 https 分片"));
+    assert.ok(!html.includes("按看到过的协议推断"));
+    // https 版但只有明文进来：提示。
+    store = createStore();
+    env = createEnv({ server, store, argument: "mode=https" });
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    html = (await env.run(page("/"))).value.response.body;
+    assert.ok(html.includes("http + https 模式"));
+    assert.ok(html.includes("没有收到任何 https 分片"));
+    assert.ok(html.includes("*.bilivideo.com"));
+    // https 分片进来了：提示消失，行首有锁。
+    const httpsUrl = "https://" + MEDIA_URL.slice("http://".length);
+    await env.run(mediaRequest({ url: httpsUrl, headers: { Range: "bytes=0-1048575" } }));
+    html = (await env.run(page("/"))).value.response.body;
+    assert.ok(!html.includes("没有收到任何 https 分片"));
+    assert.ok(html.includes("🔒 upos-hz-mirrorakam"));
+    const stats = store.json("btr.stats");
+    assert.deepEqual(stats.schemes, { http: 1, https: 1 });
+    // 老模块没有 argument：按看到过的协议推断并注明。
+    env = createEnv({ server, store });
+    html = (await env.run(page("/"))).value.response.body;
+    assert.ok(html.includes("按看到过的协议推断"));
+    assert.ok(html.includes("http + https 模式"));
+  } finally {
+    await server.close();
+  }
+});
+
+test("设置页带一键复制：日志和诊断 JSON 预先放在页面里，节点名省略后缀", async () => {
+  const store = createStore();
+  store.setJson("btr.log", ["12:00:00 [info] accelerated/ok video 0-1 5ms"]);
+  store.setJson("btr.health", { hosts: { "upos-sz-mirrorali.bilivideo.com": { bps: 1000000, okAt: Date.now(), measuredAt: Date.now(), lastError: "x".repeat(80) } } });
+  const env = createEnv({ server: null, store });
+  const html = (await env.run(page("/"))).value.response.body;
+  assert.ok(html.includes("data-copy=log") && html.includes("data-copy=diag"));
+  assert.ok(html.includes("<textarea id=copy-log") && html.includes("accelerated/ok video 0-1 5ms"));
+  assert.ok(html.includes("<textarea id=copy-diag") && html.includes("&quot;version&quot;"));
+  assert.ok(html.includes("<abbr title=\"upos-sz-mirrorali.bilivideo.com\">upos-sz-mirrorali</abbr>"));
+  assert.ok(html.includes("x".repeat(36) + "…"), "过长的错误信息要截断");
+  assert.ok(html.includes("class=scroll"));
+});
+
+test("模块和配置文件的脚本行都声明了模式", () => {
+  const dir = path.resolve(__dirname, "..", "shadowrocket");
+  for (const file of fs.readdirSync(dir).filter((name) => /\.(sgmodule|conf)$/.test(name))) {
+    const text = fs.readFileSync(path.join(dir, file), "utf8");
+    const mode = file.includes("https") ? "https" : "http";
+    const lines = text.split("\n").filter((line) => /^btr-(media|settings) = /.test(line));
+    for (const line of lines) assert.ok(line.includes(`argument=mode=${mode},`), `${file}: ${line}`);
+  }
+});
+
 test("不存在的页面返回 404", async () => {
   const env = createEnv({ server: null });
   const { value } = await env.run(page("/nothing"));

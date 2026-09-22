@@ -57,7 +57,7 @@
   }
 
   function emptyStats() {
-    return { since: Date.now(), seen: 0, accelerated: 0, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, recent: [] };
+    return { since: Date.now(), seen: 0, accelerated: 0, rewritten: 0, passthrough: {}, bytes: 0, elapsedMs: 0, recent: [], schemes: {}, lastHttpAt: 0, lastHttpsAt: 0 };
   }
 
   function loadStats() {
@@ -65,6 +65,7 @@
     if (!stored || typeof stored !== "object" || typeof stored.seen !== "number") return emptyStats();
     if (!stored.passthrough || typeof stored.passthrough !== "object") stored.passthrough = {};
     if (!Array.isArray(stored.recent)) stored.recent = [];
+    if (!stored.schemes || typeof stored.schemes !== "object") stored.schemes = {};
     return stored;
   }
 
@@ -75,6 +76,11 @@
   // entry: { at, kind, host, range, length, result, reason, elapsedMs, threads, hosts, error }
   function recordOutcome(stats, entry) {
     stats.seen += 1;
+    if (entry.scheme) {
+      stats.schemes[entry.scheme] = (stats.schemes[entry.scheme] || 0) + 1;
+      if (entry.scheme === "https") stats.lastHttpsAt = entry.at;
+      else if (entry.scheme === "http") stats.lastHttpAt = entry.at;
+    }
     if (entry.result === "accelerated") {
       stats.accelerated += 1;
       stats.bytes += Number(entry.length) || 0;
@@ -144,6 +150,30 @@
   function loadEnvFlags() {
     const stored = env.store.readJson(ENV_KEY, null);
     return stored && typeof stored === "object" ? stored : {};
+  }
+
+  // 脚本自己是 http 版还是 https 版：模块脚本行的 argument=mode=… 告诉它。每次运行都记一下，
+  // 设置页那次运行也带同样的参数，所以直接读就行；没有参数的老模块按看到过的协议推断。
+  function currentMode(stats) {
+    const declared = env.argumentValue("mode");
+    if (declared === "https" || declared === "http") return { mode: declared, declared: true };
+    return { mode: stats && stats.schemes && stats.schemes.https ? "https" : "http", declared: false };
+  }
+
+  // https 版装好了却一直没有 https 分片进来，多半是解密没生效：证书没装、没信任，或域名不在解密列表里。
+  function httpsProblem(mode, stats) {
+    if (mode.mode !== "https" || !mode.declared) return "";
+    const now = Date.now();
+    const window = 10 * 60 * 1000;
+    const httpRecently = stats.lastHttpAt && now - stats.lastHttpAt < window;
+    const httpsRecently = stats.lastHttpsAt && now - stats.lastHttpsAt < window;
+    if (httpRecently && !httpsRecently) return "recent";
+    if (!stats.lastHttpsAt && stats.seen > 20) return "never";
+    return "";
+  }
+
+  function shortHost(host) {
+    return String(host || "").replace(/\.(bilivideo\.(com|cn|net)|akamaized\.net)$/i, "");
   }
 
   function saveEnvFlags(flags) {
@@ -245,17 +275,42 @@
     const reasonRows = Object.keys(stats.passthrough).sort().map(function (reason) {
       return "<tr><td>" + escapeHtml(REASON_LABELS[reason] || reason) + "</td><td class=num>" + stats.passthrough[reason] + "</td></tr>";
     }).join("");
+    const hostCell = function (host) {
+      return "<td class=host><abbr title=\"" + escapeHtml(host) + "\">" + escapeHtml(shortHost(host)) + "</abbr></td>";
+    };
     const healthRows = Object.keys(health.hosts).sort().map(function (host) {
       const record = health.hosts[host];
-      const state = (record.blockedUntil || 0) > now ? "退避中" : record.okAt ? "正常" : record.failAt ? "失败过" : "未知";
-      return "<tr><td class=host>" + escapeHtml(host) + "</td><td>" + state + "</td><td class=num>" + formatSpeed(record.bps) + "</td><td class=num>" + (record.fails || 0) + "</td><td>" + escapeHtml(record.lastError || "") + "</td></tr>";
+      const hostState = (record.blockedUntil || 0) > now ? "退避中" : record.okAt ? "正常" : record.failAt ? "失败过" : "未知";
+      const lastError = String(record.lastError || "");
+      return "<tr>" + hostCell(host) + "<td>" + hostState + "</td><td class=num>" + formatSpeed(record.bps) + "</td><td class=num>" + (record.fails || 0) + "</td><td class=err><abbr title=\"" + escapeHtml(lastError) + "\">" + escapeHtml(lastError.length > 36 ? lastError.slice(0, 36) + "…" : lastError) + "</abbr></td></tr>";
     }).join("");
     const recentRows = stats.recent.map(function (entry) {
-      const usage = entry.hosts ? Object.keys(entry.hosts).map(function (host) { return host.split(".")[0] + "×" + entry.hosts[host]; }).join(" ") : "";
+      const usage = entry.hosts ? Object.keys(entry.hosts).map(function (host) { return shortHost(host).replace(/^upos-sz-/, "") + "×" + entry.hosts[host]; }).join(" ") : "";
       const speed = entry.result === "accelerated" && entry.elapsedMs ? formatSpeed(entry.length * 1000 / entry.elapsedMs) : "";
-      return "<tr><td>" + formatTime(entry.at) + "</td><td>" + escapeHtml(entry.kind === "audio" ? "音" : entry.kind === "video" ? "画" : "?") + "</td><td class=host>" + escapeHtml(entry.host || "") + (entry.path ? "<br><small>" + escapeHtml((entry.scheme && entry.scheme !== "http" ? entry.scheme + " " : "") + entry.path) + "</small>" : "") + "</td><td class=num>" + escapeHtml(entry.range || "") + "</td><td class=num>" + (entry.length ? formatBytes(entry.length) : "") + "</td><td>" + escapeHtml(RESULT_LABELS[entry.result] || entry.result || "") + (entry.reason && entry.reason !== "ok" ? "<br><small>" + escapeHtml(REASON_LABELS[entry.reason] || entry.reason) + "</small>" : "") + (entry.error ? "<br><small>" + escapeHtml(entry.error) + "</small>" : "") + "</td><td class=num>" + (entry.elapsedMs || 0) + " ms" + (speed ? "<br><small>" + speed + "</small>" : "") + (entry.threads ? "<br><small>" + entry.threads + " 块 " + escapeHtml(usage) + "</small>" : "") + "</td></tr>";
+      const pathText = entry.path ? String(entry.path).split("/").pop() : "";
+      return "<tr><td class=num>" + formatTime(entry.at) + "</td><td>" + escapeHtml(entry.kind === "audio" ? "音" : entry.kind === "video" ? "画" : "?") + "</td>"
+        + "<td class=host><abbr title=\"" + escapeHtml((entry.scheme || "") + "://" + (entry.host || "") + (entry.path || "")) + "\">" + escapeHtml((entry.scheme === "https" ? "🔒 " : "") + shortHost(entry.host)) + (pathText ? "<br><small>" + escapeHtml(pathText) + "</small>" : "") + "</abbr></td>"
+        + "<td class=num>" + escapeHtml(entry.range || "") + (entry.length ? "<br><small>" + formatBytes(entry.length) + "</small>" : "") + "</td>"
+        + "<td>" + escapeHtml(RESULT_LABELS[entry.result] || entry.result || "") + (entry.reason && entry.reason !== "ok" ? "<br><small>" + escapeHtml(REASON_LABELS[entry.reason] || entry.reason) + "</small>" : "") + (entry.error ? "<br><small>" + escapeHtml(entry.error) + "</small>" : "") + "</td>"
+        + "<td class=num>" + (entry.elapsedMs || 0) + " ms" + (speed ? "<br><small>" + speed + "</small>" : "") + (entry.threads ? "<br><small>" + entry.threads + " 块 " + escapeHtml(usage) + "</small>" : "") + "</td></tr>";
     }).join("");
     const message = state.message ? "<div class=notice>" + escapeHtml(state.message) + "</div>" : "";
+    const mode = currentMode(stats);
+    const modeBadge = "<span class=\"badge" + (mode.mode === "https" ? " on" : "") + "\">" + (mode.mode === "https" ? "http + https 模式" : "http 明文模式") + "</span>";
+    const problem = httpsProblem(mode, stats);
+    const httpsWarning = problem
+      ? "<div class=warn><b>https 版已装好，但脚本没有收到任何 https 分片"
+        + (problem === "recent" ? "（最近十分钟只有明文分片进来）" : "") + "。</b>多半是 HTTPS 解密没有真正生效，逐项检查："
+        + "<ol style=\"margin:8px 0 0;padding-left:20px\">"
+        + "<li>配置 → 点当前配置文件右侧的 ⓘ → HTTPS 解密：开关是否打开。</li>"
+        + "<li>同一页「域名」列表里必须有 <code>*.bilivideo.com</code>、<code>*.bilivideo.cn</code>、<code>*.bilivideo.net</code>、<code>*.akamaized.net</code>。只有 <code>*.bilibili.com</code> 是不够的，视频分片不走那个域名。</li>"
+        + "<li>同一页「证书」→ 生成新的 CA 证书 → 安装证书；然后 系统设置 → 已下载描述文件 → 安装。</li>"
+        + "<li>系统设置 → 通用 → 关于本机 → 证书信任设置 → 打开 Shadowrocket 的证书。</li>"
+        + "<li>做完后在 数据 → 代理 里看 <code>upos-</code> 的 443 连接是否变成 <code>https://upos-…/upgcxcode/…</code> 的完整地址。</li>"
+        + "</ol>如果证书都装好了，App 的 https 分片仍然全部放不出来，说明 App 对视频域名做了证书固定，请改回 http 版。</div>"
+      : "";
+    const logText = loadLog().join("\n");
+    const diagText = JSON.stringify({ version: BTR.VERSION, capabilities, settings, flags, stats, health, log: loadLog() }, null, 2);
     const auto = AUTO_REFRESH_OPTIONS.indexOf(state.autoRefresh) >= 0 ? state.autoRefresh : 0;
     const refreshMeta = auto ? "<meta http-equiv=\"refresh\" content=\"" + auto + ";url=/?auto=" + auto + "\">" : "";
     const refreshLinks = "<div class=sub>自动刷新：" + (auto ? "<a href=\"/\">关</a>" : "<b>关</b>") + AUTO_REFRESH_OPTIONS.map(function (seconds) {
@@ -282,16 +337,20 @@
       + "input[type=checkbox]{width:22px;height:22px}"
       + "button,.btn{display:inline-block;font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:10px;background:#fb7299;color:#fff;text-decoration:none;margin:6px 6px 0 0}"
       + ".btn.secondary{background:#e3e5e7;color:#18191c}"
-      + "table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 4px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500}"
-      + "td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}td.host{word-break:break-all}"
+      + ".scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}"
+      + "table{width:100%;min-width:560px;border-collapse:collapse;font-size:13px}th,td{padding:6px 6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500;white-space:nowrap}"
+      + "td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}td.host{white-space:nowrap}td.err{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}abbr{text-decoration:none}"
+      + "code{font:12px ui-monospace,Menlo,monospace;background:#f1f2f3;padding:1px 4px;border-radius:4px}"
+      + ".copied{color:#0c6b3b;font-size:13px;margin-left:8px}"
       + ".notice{background:#e6f7ee;color:#0c6b3b;border-radius:10px;padding:10px 14px;margin:12px 0}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px;margin:12px 0}"
       + ".kv{display:grid;grid-template-columns:1fr 1fr;gap:8px}.kv div{background:#f7f8fa;border-radius:10px;padding:10px}.kv b{display:block;font-size:20px}.kv small{color:#61666d}"
       + ".badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#e3e5e7}.badge.on{background:#fb7299;color:#fff}"
       + "</style></head><body>"
-      + "<h1>Bilibili 线程撕裂者 <span class=badge" + (settings.enabled ? " on" : "") + ">" + (settings.enabled ? "已启用" : "已停用") + "</span></h1>"
-      + "<div class=sub>移动端 · Shadowrocket 脚本 · 版本 " + escapeHtml(BTR.VERSION) + "</div>"
+      + "<h1>Bilibili 线程撕裂者 <span class=badge" + (settings.enabled ? " on" : "") + ">" + (settings.enabled ? "已启用" : "已停用") + "</span> " + modeBadge + "</h1>"
+      + "<div class=sub>移动端 · Shadowrocket 脚本 · 版本 " + escapeHtml(BTR.VERSION)
+      + (mode.declared ? "" : " · 模块没有声明模式，按看到过的协议推断") + "</div>"
       + refreshLinks
-      + message + warningHtml
+      + message + httpsWarning + warningHtml
       + "<div class=card><div class=kv>"
       + "<div><small>看到的分片请求</small><b>" + stats.seen + "</b></div>"
       + "<div><small>多线程完成</small><b>" + stats.accelerated + "</b></div>"
@@ -326,13 +385,23 @@
       + "<button type=submit>保存</button>"
       + "</form>"
       + "<div class=card><h2 style=\"margin-top:0\">节点记忆</h2>"
-      + (healthRows ? "<table><tr><th>节点</th><th>状态</th><th>速度</th><th>连败</th><th>最近错误</th></tr>" + healthRows + "</table>" : "<div class=sub>还没有节点数据。播放一个视频后再来看。</div>")
+      + (healthRows ? "<div class=scroll><table><tr><th>节点</th><th>状态</th><th>速度</th><th>连败</th><th>最近错误</th></tr>" + healthRows + "</table></div><div class=sub style=\"margin-top:6px\">节点名省略了 .bilivideo.com 后缀，长按可看全名；表格可以左右滑动。</div>" : "<div class=sub>还没有节点数据。播放一个视频后再来看。</div>")
       + "</div>"
       + "<div class=card><h2 style=\"margin-top:0\">放过原因</h2>"
       + (reasonRows ? "<table>" + reasonRows + "</table>" : "<div class=sub>暂无</div>")
       + "</div>"
       + "<div class=card><h2 style=\"margin-top:0\">最近请求</h2>"
-      + (recentRows ? "<table><tr><th>时间</th><th></th><th>原节点</th><th>Range</th><th>大小</th><th>结果</th><th>耗时</th></tr>" + recentRows + "</table>" : "<div class=sub>暂无。打开 B 站 App 播放一个视频，再刷新这个页面。</div>")
+      + (recentRows ? "<div class=scroll><table><tr><th>时间</th><th></th><th>原节点</th><th>Range</th><th>结果</th><th>耗时</th></tr>" + recentRows + "</table></div>" : "<div class=sub>暂无。打开 B 站 App 播放一个视频，再刷新这个页面。</div>")
+      + "</div>"
+      + "<div class=card><h2 style=\"margin-top:0\">复制</h2>"
+      + "<div class=sub>点一下就复制到剪贴板，直接粘贴给别人看。都不含签名地址和 Cookie。</div>"
+      + "<button type=button data-copy=log>复制日志</button>"
+      + "<button type=button data-copy=diag>复制诊断 JSON</button><span class=copied id=copied></span>"
+      + "<textarea id=copy-log readonly style=\"position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0\">" + escapeHtml(logText) + "</textarea>"
+      + "<textarea id=copy-diag readonly style=\"position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0\">" + escapeHtml(diagText) + "</textarea>"
+      + "<script>(function(){var tip=document.getElementById('copied');function copyFrom(id){var ta=document.getElementById(id);var text=ta.value;if(navigator.clipboard&&window.isSecureContext){return navigator.clipboard.writeText(text).then(function(){return true;},function(){return legacy(ta);});}return Promise.resolve(legacy(ta));}"
+      + "function legacy(ta){var ok=false;try{ta.readOnly=false;ta.contentEditable='true';var range=document.createRange();range.selectNodeContents(ta);var sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);ta.setSelectionRange(0,ta.value.length);ok=document.execCommand('copy');}catch(e){ok=false;}try{ta.readOnly=true;ta.contentEditable='false';window.getSelection().removeAllRanges();}catch(e){}return ok;}"
+      + "[].forEach.call(document.querySelectorAll('button[data-copy]'),function(btn){btn.addEventListener('click',function(){copyFrom('copy-'+btn.getAttribute('data-copy')).then(function(ok){tip.textContent=ok?'已复制':'复制失败，请打开 /log.txt 手动全选';setTimeout(function(){tip.textContent='';},2500);});});});})();</script>"
       + "</div>"
       + "<div class=card><h2 style=\"margin-top:0\">操作</h2>"
       + "<a class=\"btn secondary\" href=\"/reset?what=stats\">清空统计</a>"

@@ -3,9 +3,11 @@
 (function (BTR) {
   "use strict";
 
-  /* global $request, $done, $httpClient, $persistentStore, $notification */
+  /* global $request, $done, $httpClient, $persistentStore, $notification, $argument */
   const api = {
     request: typeof $request !== "undefined" ? $request : null,
+    // 模块脚本行上的 argument=…，例如 mode=https。
+    argument: typeof $argument !== "undefined" ? $argument : null,
     done: typeof $done === "function" ? $done : null,
     httpClient: typeof $httpClient !== "undefined" ? $httpClient : null,
     persistentStore: typeof $persistentStore !== "undefined" ? $persistentStore : null,
@@ -185,6 +187,21 @@
     return true;
   }
 
+  // argument 的写法是 a=b&c=d，或者环境直接给对象。
+  function argumentValue(name) {
+    const raw = api.argument;
+    if (!raw) return "";
+    if (typeof raw === "object") return raw[name] == null ? "" : String(raw[name]);
+    const pairs = String(raw).split("&");
+    for (let index = 0; index < pairs.length; index += 1) {
+      const pair = pairs[index];
+      const at = pair.indexOf("=");
+      const key = at >= 0 ? pair.slice(0, at) : pair;
+      if (key.trim() === name) return at >= 0 ? pair.slice(at + 1).trim() : "";
+    }
+    return "";
+  }
+
   function capabilities() {
     return {
       request: Boolean(api.request),
@@ -197,6 +214,7 @@
 
   BTR.env = Object.freeze({
     api,
+    argumentValue,
     capabilities,
     finish,
     httpGet,
