@@ -48,7 +48,7 @@
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 4;
+  const SETTINGS_REVISION = 5;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -59,6 +59,9 @@
     if (revision < 3 && raw.mode === "mainland") delete raw.mode;
     // 第 4 版：单个分片的总时限从 20 秒改成 10 秒。
     if (revision < 4 && Number(raw.deadlineSec) === 20) delete raw.deadlineSec;
+    // 第 5 版：总时限 10 → 3 秒，单块尝试 6 → 4 秒。
+    if (revision < 5 && Number(raw.deadlineSec) === 10) delete raw.deadlineSec;
+    if (revision < 5 && Number(raw.attemptTimeoutSec) === 6) delete raw.attemptTimeoutSec;
     return core.normalizeSettings(raw);
   }
 

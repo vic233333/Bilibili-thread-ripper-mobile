@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.4.0
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.5.0
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.4.0" };
+const BTR = { VERSION: "0.5.0" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -177,9 +177,10 @@ const BTR = { VERSION: "0.4.0" };
       // 提前预读（真机验证：脚本交出响应之后，它发出的请求再也不会有回调），能做的只有
       // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
       overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
-      attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 6)),
-      // 20 秒太长：App 等不到三秒就自己重发，这边却还占着全局在途的名额。
-      deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 10)),
+      attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 2, 30, 4)),
+      // 真机实测：App 从发出请求到重发同一段，中位数正好 3 秒。拖过这个点再拼好也没人要了，
+      // 还白占着全局在途的名额，不如早点原样交回去，让 App 自己去它的节点拿。
+      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 3)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },
@@ -551,6 +552,17 @@ const BTR = { VERSION: "0.4.0" };
     return health.hosts[host];
   }
 
+  // 记分跌得快、涨得慢。真机日志里，一个节点可以在一秒之内从 1 MiB/168 毫秒掉到 1 MiB/5.7 秒；
+  // 对称的 EWMA 要四五次测量才会把它赶下领跑位，那就是四五段、二十多秒的卡顿。
+  const RISE = 0.3;
+  const FALL = 0.7;
+
+  function blend(previous, sample) {
+    if (!(previous > 0)) return sample;
+    const weight = sample < previous ? FALL : RISE;
+    return previous * (1 - weight) + sample * weight;
+  }
+
   function markSuccess(health, host, bytes, elapsedMs) {
     const record = recordOf(health, host);
     const now = Date.now();
@@ -558,10 +570,71 @@ const BTR = { VERSION: "0.4.0" };
     record.blockedUntil = 0;
     record.okAt = now;
     if (bytes >= SPEED_SAMPLE_MIN_BYTES && elapsedMs > 0) {
-      const bps = bytes * 1000 / elapsedMs;
-      record.bps = record.bps ? record.bps * 0.65 + bps * 0.35 : bps;
+      record.bps = blend(record.bps, bytes * 1000 / elapsedMs);
       record.measuredAt = now;
     }
+  }
+
+  // 整段的实测速度才是“这个节点开五六路能有多快”的可靠证据：单块的测量（试探块、救急的副本）
+  // 偏乐观，块小、连接新，读出来的速度撑不起整段。只有某个节点拿走了一段里绝大多数块时才记。
+  const SEGMENT_SHARE = 0.8;
+  const SEGMENT_TTL_MS = 5 * 60 * 1000;
+
+  function markSegment(health, usage, bytes, elapsedMs) {
+    const hosts = Object.keys(usage || {});
+    if (!hosts.length || !(bytes > 0) || !(elapsedMs > 0)) return "";
+    let total = 0;
+    let lead = hosts[0];
+    hosts.forEach(function (host) {
+      total += usage[host];
+      if (usage[host] > usage[lead]) lead = host;
+    });
+    if (!total || usage[lead] / total < SEGMENT_SHARE) return "";
+    const record = recordOf(health, lead);
+    record.segBps = blend(record.segBps, bytes * 1000 / elapsedMs);
+    record.segAt = Date.now();
+    return lead;
+  }
+
+  // 领跑者的分数。有整段实测就用整段的；只有单块测量的打对折，因为它偏乐观。
+  // App 自己用的那个节点加一点分：它是 B 站调度给这台设备的，地址也是为它签的。
+  const PIECE_DISCOUNT = 0.5;
+  const ORIGINAL_BONUS = 1.25;
+  // 想把在位的领跑者换掉，要比它快这么多倍。换来换去的代价很大：真机日志里五分钟换了 34 次，
+  // 每次换到差节点就是一段五六秒。
+  const SWITCH_MARGIN = 1.5;
+
+  function hostScore(health, host, originalHost) {
+    const record = health.hosts[host];
+    if (!record) return 0;
+    const fresh = record.segAt && Date.now() - record.segAt < SEGMENT_TTL_MS;
+    const base = fresh ? (record.segBps || 0) : (record.bps || 0) * PIECE_DISCOUNT;
+    return base * (host && host === originalHost ? ORIGINAL_BONUS : 1);
+  }
+
+  // 这一段交给谁。在位的领跑者一直留任，除非有节点明显更快、或者它自己被退避了。
+  function chooseLeader(pool, health, originalHost) {
+    if (!pool.length) return "";
+    const now = Date.now();
+    // 退避中的节点不当领跑者，除非所有节点都在退避。
+    const usable = pool.filter(function (host) { return !isBlocked(health.hosts[host], now); });
+    const ranked = (usable.length ? usable : pool).slice().sort(function (a, b) {
+      return hostScore(health, b, originalHost) - hostScore(health, a, originalHost);
+    });
+    const best = ranked[0];
+    const held = health.leader;
+    const incumbent = held && pool.indexOf(held) >= 0 && !isBlocked(health.hosts[held], now) ? held : "";
+    if (!incumbent) {
+      health.leader = best;
+      health.leaderAt = now;
+      return best;
+    }
+    if (best !== incumbent && hostScore(health, best, originalHost) > hostScore(health, incumbent, originalHost) * SWITCH_MARGIN) {
+      health.leader = best;
+      health.leaderAt = now;
+      return best;
+    }
+    return incumbent;
   }
 
   function markFailure(health, host, error) {
@@ -624,22 +697,22 @@ const BTR = { VERSION: "0.4.0" };
   // 副本等待时间，让它最多只能拖慢半秒。
   const TRIAL_INTERVAL_MS = 45 * 1000;
 
-  function fastestFirst(pool, health) {
-    return pool.map(function (host) { return { host, bps: (health.hosts[host] && health.hosts[host].bps) || 0 }; })
+  function fastestFirst(pool, health, originalHost) {
+    return pool.map(function (host) { return { host, bps: hostScore(health, host, originalHost) }; })
       .sort(function (a, b) { return b.bps - a.bps; });
   }
 
-  function assignPieces(pool, health, count) {
+  function assignPieces(pool, health, count, originalHost) {
     const assignment = [];
     if (!pool.length) return assignment;
-    const ranked = fastestFirst(pool, health);
+    const ranked = fastestFirst(pool, health, originalHost);
     const known = ranked.filter(function (entry) { return entry.bps > 0; });
     // 热身：一个测过速度的节点都没有，撒一轮把它们都量一遍。
     if (!known.length) {
       for (let index = 0; index < count; index += 1) assignment.push(pool[index % pool.length]);
       return assignment;
     }
-    const leader = known[0].host;
+    const leader = chooseLeader(pool, health, originalHost);
     for (let index = 0; index < count; index += 1) assignment.push(leader);
     // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
     const now = Date.now();
@@ -698,7 +771,7 @@ const BTR = { VERSION: "0.4.0" };
     // 第一选择是按速度分到的节点，之后按速度顺序换别的节点；退避中的排最后。
     const first = plan.assignment[piece.index] || plan.pool[piece.index % plan.pool.length];
     // 这块卡住或失败时换谁：按速度从快到慢，而不是轮着来——副本的意义就是尽快拿到这一块。
-    const order = [first].concat(fastestFirst(plan.pool, plan.health)
+    const order = [first].concat(fastestFirst(plan.pool, plan.health, plan.originalHost)
       .map(function (entry) { return entry.host; })
       .filter(function (host) { return host !== first; }));
     plan.all.forEach(function (host) { if (order.indexOf(host) < 0) order.push(host); });
@@ -813,7 +886,8 @@ const BTR = { VERSION: "0.4.0" };
       health: context.health,
       pool: ordered.pool,
       all: ordered.all,
-      assignment: assignPieces(ordered.pool, context.health, pieces.length),
+      originalHost: context.parts.host,
+      assignment: assignPieces(ordered.pool, context.health, pieces.length, context.parts.host),
       deadlineAt: startedAt + settings.deadlineSec * 1000,
       usage: {},
       attempts: 0,
@@ -855,6 +929,9 @@ const BTR = { VERSION: "0.4.0" };
       offset += result.bytes.byteLength;
     });
     if (offset !== context.range.length) throw env.makeError("BadLength", "拼接后长度不符：" + offset + "/" + context.range.length);
+    const elapsedMs = Math.max(1, Date.now() - startedAt);
+    // 这一段基本由一个节点拿下时，把整段的吞吐记在它头上，下一次选领跑者就按这个来。
+    markSegment(context.health, plan.usage, context.range.length, elapsedMs);
     return {
       bytes: output,
       total,
@@ -865,7 +942,7 @@ const BTR = { VERSION: "0.4.0" };
       hedges: plan.hedges,
       pieceMsMin: plan.pieceMs.length ? Math.min.apply(null, plan.pieceMs) : 0,
       pieceMsMax: plan.pieceMs.length ? Math.max.apply(null, plan.pieceMs) : 0,
-      elapsedMs: Math.max(1, Date.now() - startedAt)
+      elapsedMs
     };
   }
 
@@ -913,7 +990,10 @@ const BTR = { VERSION: "0.4.0" };
     downloadRange,
     fetchPiece,
     loadHealth,
+    chooseLeader,
+    hostScore,
     markFailure,
+    markSegment,
     markSuccess,
     orderCandidates,
     probeHost,
@@ -973,7 +1053,7 @@ const BTR = { VERSION: "0.4.0" };
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 4;
+  const SETTINGS_REVISION = 5;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -984,6 +1064,9 @@ const BTR = { VERSION: "0.4.0" };
     if (revision < 3 && raw.mode === "mainland") delete raw.mode;
     // 第 4 版：单个分片的总时限从 20 秒改成 10 秒。
     if (revision < 4 && Number(raw.deadlineSec) === 20) delete raw.deadlineSec;
+    // 第 5 版：总时限 10 → 3 秒，单块尝试 6 → 4 秒。
+    if (revision < 5 && Number(raw.deadlineSec) === 10) delete raw.deadlineSec;
+    if (revision < 5 && Number(raw.attemptTimeoutSec) === 6) delete raw.attemptTimeoutSec;
     return core.normalizeSettings(raw);
   }
 
@@ -1883,7 +1966,8 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
   function rewrite(parts, headers, settings, health, reason) {
     const hosts = core.candidateHosts(parts.host, settings);
     if (!hosts.length) return pass(reason);
-    const host = accelerator.orderCandidates(hosts, health, settings.threads).pool[0];
+    // 单连接也走同一个领跑者，别让“只换节点”的请求跑到一个刚被判定为慢的节点上。
+    const host = accelerator.chooseLeader(accelerator.orderCandidates(hosts, health, settings.threads).pool, health, parts.host);
     if (!host || host === parts.host) return pass(reason);
     const nextHeaders = {};
     Object.keys(headers || {}).forEach(function (key) {

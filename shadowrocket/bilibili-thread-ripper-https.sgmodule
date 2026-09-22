@@ -10,9 +10,9 @@
 # 不要和默认模块同时启用，两者会重复处理同一个请求。
 
 [Script]
-btr-media = type=http-request, pattern=^https?:\/\/[^\/]+\.(bilivideo\.(com|cn|net)|akamaized\.net|szbdyd\.com)(:\d+)?\/, argument=mode=https, requires-body=0, timeout=45, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=media&v=0.4.0
+btr-media = type=http-request, pattern=^https?:\/\/[^\/]+\.(bilivideo\.(com|cn|net)|akamaized\.net|szbdyd\.com)(:\d+)?\/, argument=mode=https, requires-body=0, timeout=45, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=media&v=0.5.0
 
-btr-settings = type=http-request, pattern=^http:\/\/btr\.settings(?:\/.*)?$, argument=mode=https, requires-body=0, timeout=10, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=settings&v=0.4.0
+btr-settings = type=http-request, pattern=^http:\/\/btr\.settings(?:\/.*)?$, argument=mode=https, requires-body=0, timeout=10, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=settings&v=0.5.0
 
 [Rule]
 # 模块里的规则只在全局路由为“配置”时生效。

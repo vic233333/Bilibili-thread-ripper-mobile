@@ -32,7 +32,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
   assert.equal(value.response.headers.Location, "http://btr.settings/?done=saved");
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
-    revision: 4,
+    revision: 5,
     enabled: true,
     accelerate: "split",
     mode: "custom",
@@ -62,7 +62,7 @@ test("越界的值会被拉回范围，缺失的复选框当作关闭", async ()
   assert.equal(saved.threads, 6);
   assert.equal(saved.maxMiB, 24);
   assert.equal(saved.minChunkKiB, 64);
-  assert.equal(saved.attemptTimeoutSec, 3);
+  assert.equal(saved.attemptTimeoutSec, 2);
   assert.equal(saved.deadlineSec, 40);
   assert.equal(saved.swapSingle, false);
 });
@@ -81,7 +81,7 @@ test("第 1 版设置里保存的旧默认值 256 KiB 让位给新默认值，�
   diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
   assert.equal(diag.settings.minChunkKiB, 256);
   assert.equal(BTR.core.normalizeSettings({}).minChunkKiB, 128);
-  assert.equal(BTR.core.normalizeSettings({}).attemptTimeoutSec, 6);
+  assert.equal(BTR.core.normalizeSettings({}).attemptTimeoutSec, 4);
   // 第 3 版：旧版本保存的“大陆”让位给“自动”；第 3 版自己保存的“大陆”保留。
   const oldMainland = createStore();
   oldMainland.setJson("btr.settings", { revision: 2, mode: "mainland" });
@@ -118,7 +118,7 @@ test("全部重置把设置也恢复成默认值", async () => {
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=all"));
   assert.equal(value.response.status, 302);
-  assert.deepEqual(store.json("btr.settings"), { revision: 4 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 5 });
   assert.deepEqual(store.json("btr.busy"), {});
   assert.deepEqual(store.json("btr.lastMedia"), {});
   const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
@@ -137,9 +137,22 @@ test("恢复默认设置只动设置，统计和节点记忆留着", async () =>
   const { value } = await env.run(page("/reset?what=settings"));
   assert.equal(value.response.status, 302);
   assert.ok((await env.run(page("/?done=reset&what=settings"))).value.response.body.includes("恢复默认"));
-  assert.deepEqual(store.json("btr.settings"), { revision: 4 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 5 });
   assert.equal(store.json("btr.stats").seen, 9);
   assert.ok(store.json("btr.health").hosts["upos-sz-mirrorali.bilivideo.com"]);
+});
+
+test("第 4 版保存的旧时限让位给新默认值，用户自己改过的保留", async () => {
+  const stale = createStore();
+  stale.setJson("btr.settings", { revision: 4, deadlineSec: 10, attemptTimeoutSec: 6 });
+  let diag = JSON.parse((await createEnv({ server: null, store: stale }).run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.deadlineSec, 3, "10 秒是第 4 版的默认值，不是用户的选择");
+  assert.equal(diag.settings.attemptTimeoutSec, 4);
+  const chosen = createStore();
+  chosen.setJson("btr.settings", { revision: 4, deadlineSec: 25, attemptTimeoutSec: 8 });
+  diag = JSON.parse((await createEnv({ server: null, store: chosen }).run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.deadlineSec, 25, "自己改过的值要保留");
+  assert.equal(diag.settings.attemptTimeoutSec, 8);
 });
 
 test("诊断 JSON 包含版本、能力、设置和统计", async () => {
@@ -593,6 +606,75 @@ test("一段只用最快的那个节点；隔一阵子留一块去试没测过�
   // 一个都没测过：撒一轮，把它们一次都量出来。
   const warm = assignPieces(pool, { hosts: {} }, 7);
   assert.deepEqual(warm, ["fast.bilivideo.com", "near.bilivideo.com", "half.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com", "fast.bilivideo.com", "near.bilivideo.com"]);
+});
+
+test("领跑者：在位的不轻易换，明显更快的才换得掉", async () => {
+  const BTR = await loadModules();
+  const { chooseLeader, hostScore } = BTR.accelerator;
+  const now = Date.now();
+  const pool = ["akam.akamaized.net", "aliov.bilivideo.com", "cosov.bilivideo.com"];
+  const seg = (bps) => ({ segBps: bps, segAt: now });
+
+  // 在位的领跑者速度接近时留任：真机日志里五分钟换了 34 次，每次换错就是一段五六秒。
+  const close = { leader: "akam.akamaized.net", hosts: {
+    "akam.akamaized.net": seg(8e6), "aliov.bilivideo.com": seg(10e6), "cosov.bilivideo.com": seg(2e6) } };
+  assert.equal(chooseLeader(pool, close, ""), "akam.akamaized.net", "只快 1.25 倍，不值得换");
+
+  // 明显更快才换。
+  const clear = { leader: "akam.akamaized.net", hosts: {
+    "akam.akamaized.net": seg(2e6), "aliov.bilivideo.com": seg(9e6), "cosov.bilivideo.com": seg(1e6) } };
+  assert.equal(chooseLeader(pool, clear, ""), "aliov.bilivideo.com");
+  assert.equal(clear.leader, "aliov.bilivideo.com", "换了就要记下来");
+
+  // 在位的被退避了，立刻换人。
+  const blocked = { leader: "akam.akamaized.net", hosts: {
+    "akam.akamaized.net": Object.assign(seg(9e6), { blockedUntil: now + 30000 }),
+    "aliov.bilivideo.com": seg(1e6), "cosov.bilivideo.com": seg(2e6) } };
+  assert.equal(chooseLeader(pool, blocked, ""), "cosov.bilivideo.com");
+
+  // 只有单块测量的节点打对折，再加上 1.5 倍的门槛，等于要三倍才推得翻整段实测过的在位者。
+  const thin = { leader: "akam.akamaized.net", hosts: {
+    "akam.akamaized.net": seg(4e6), "aliov.bilivideo.com": { bps: 10e6, measuredAt: now } } };
+  assert.equal(chooseLeader(pool, thin, ""), "akam.akamaized.net", "一次侥幸的快块不该改朝换代");
+  assert.ok(hostScore(thin, "aliov.bilivideo.com", "") < hostScore(thin, "akam.akamaized.net", "") * 1.5,
+    "10 MB/s 的单块打完对折也够不到整段实测 4 MB/s 的 1.5 倍");
+
+  // App 自己那个节点加分：势均力敌时留在它上面。
+  const tie = { leader: "", hosts: { "akam.akamaized.net": seg(5e6), "aliov.bilivideo.com": seg(6e6) } };
+  assert.equal(chooseLeader(pool, tie, "akam.akamaized.net"), "akam.akamaized.net");
+});
+
+test("记分跌得快涨得慢，崩掉的节点一两段就让位", async () => {
+  const BTR = await loadModules();
+  const { markSuccess, markSegment, chooseLeader } = BTR.accelerator;
+  const health = { hosts: {} };
+
+  // 一个 10 MB/s 的节点，连续两块只有 30 KB/s：分数要掉到跟它现在的实力一个量级。
+  markSuccess(health, "fast.bilivideo.com", 1048576, 100);
+  const peak = health.hosts["fast.bilivideo.com"].bps;
+  assert.ok(peak > 9e6);
+  markSuccess(health, "fast.bilivideo.com", 174763, 5700);
+  assert.ok(health.hosts["fast.bilivideo.com"].bps < peak * 0.35, "一次就要掉下来一大截");
+  markSuccess(health, "fast.bilivideo.com", 174763, 5700);
+  assert.ok(health.hosts["fast.bilivideo.com"].bps < 1e6);
+  // 反过来，一次快样本只能把它抬回去一点点。
+  const low = health.hosts["fast.bilivideo.com"].bps;
+  markSuccess(health, "fast.bilivideo.com", 1048576, 100);
+  assert.ok(health.hosts["fast.bilivideo.com"].bps < low + 10e6 * 0.35);
+
+  // 整段实测：一个节点拿走八成以上的块才算数。
+  const seg = { hosts: {} };
+  assert.equal(markSegment(seg, { "a.bilivideo.com": 3, "b.bilivideo.com": 3 }, 1048576, 1000), "", "两家平分不算谁的成绩");
+  assert.equal(markSegment(seg, { "a.bilivideo.com": 4, "b.bilivideo.com": 2 }, 1048576, 1000), "", "四比二不到八成");
+  assert.equal(markSegment(seg, { "a.bilivideo.com": 5, "b.bilivideo.com": 1 }, 1048576, 100), "a.bilivideo.com", "六块里只有一块借了别家，仍然算这个节点的成绩");
+  assert.equal(markSegment(seg, { "a.bilivideo.com": 6 }, 1048576, 100), "a.bilivideo.com");
+  assert.ok(seg.hosts["a.bilivideo.com"].segBps > 9e6);
+  // 同一个节点下一段崩了，整段实测同样跌得快。
+  markSegment(seg, { "a.bilivideo.com": 6 }, 1048576, 5700);
+  assert.ok(seg.hosts["a.bilivideo.com"].segBps < 3.5e6);
+  seg.leader = "a.bilivideo.com";
+  seg.hosts["b.bilivideo.com"] = { segBps: 9e6, segAt: Date.now() };
+  assert.equal(chooseLeader(["a.bilivideo.com", "b.bilivideo.com"], seg, ""), "b.bilivideo.com", "崩了就该换人");
 });
 
 test("构建产物带有原作署名，且与 package.json 版本一致", () => {
