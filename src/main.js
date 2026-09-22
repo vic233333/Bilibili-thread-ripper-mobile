@@ -140,7 +140,10 @@
     } catch (error) {
       env.log("error", "统计保存失败", error);
     }
-    env.log(outcome.result === "accelerated" ? "info" : "debug", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", entry.hosts || entry.rewrittenTo || entry.error || "");
+    // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
+    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", entry.hosts || entry.rewrittenTo || entry.error || "");
+    try { settingsModule.appendLog(env.logLines, startedAt); }
+    catch (error) { env.log("error", "日志保存失败", error); }
     env.finish(outcome.done);
   }
 

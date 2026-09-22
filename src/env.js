@@ -28,11 +28,15 @@
     catch (_error) { return String(value); }
   }
 
+  // 这次运行写下的日志，运行结束时由 main 追加到持久存储，在设置页的 /log.txt 里能看到。
+  const logLines = [];
   function log(level, message, detail) {
     if (level === "debug" && !debugEnabled) return;
-    if (!api.console || typeof api.console.log !== "function") return;
     const suffix = detail === undefined ? "" : " " + safeString(detail);
-    try { api.console.log("[BTR " + level + "] " + message + suffix); }
+    const line = "[" + level + "] " + message + suffix;
+    logLines.push(line);
+    if (!api.console || typeof api.console.log !== "function") return;
+    try { api.console.log("[BTR] " + line); }
     catch (_error) {}
   }
 
@@ -186,6 +190,7 @@
     finish,
     httpGet,
     log,
+    logLines,
     makeError,
     notify,
     safeString,

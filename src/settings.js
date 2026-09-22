@@ -10,7 +10,10 @@
   const SETTINGS_KEY = "btr.settings";
   const STATS_KEY = "btr.stats";
   const ENV_KEY = "btr.env";
+  const LOG_KEY = "btr.log";
   const RECENT_LIMIT = 12;
+  const LOG_LIMIT = 300;
+  const AUTO_REFRESH_OPTIONS = [5, 15, 30];
 
   function loadRawSettings() {
     return env.store.readJson(SETTINGS_KEY, {});
@@ -69,6 +72,21 @@
     }
     stats.recent.unshift(entry);
     if (stats.recent.length > RECENT_LIMIT) stats.recent.length = RECENT_LIMIT;
+  }
+
+  function loadLog() {
+    const stored = env.store.readJson(LOG_KEY, null);
+    return Array.isArray(stored) ? stored : [];
+  }
+
+  // 把这次运行的日志追加到持久存储，只留最近的几百行。
+  function appendLog(lines, at) {
+    if (!lines || !lines.length) return false;
+    const stamp = formatTime(at || Date.now());
+    const log = loadLog();
+    lines.forEach(function (line) { log.push(stamp + " " + line); });
+    if (log.length > LOG_LIMIT) log.splice(0, log.length - LOG_LIMIT);
+    return env.store.writeJson(LOG_KEY, log);
   }
 
   function loadEnvFlags() {
@@ -184,6 +202,11 @@
       return "<tr><td>" + formatTime(entry.at) + "</td><td>" + escapeHtml(entry.kind === "audio" ? "音" : entry.kind === "video" ? "画" : "?") + "</td><td class=host>" + escapeHtml(entry.host || "") + "</td><td class=num>" + escapeHtml(entry.range || "") + "</td><td class=num>" + (entry.length ? formatBytes(entry.length) : "") + "</td><td>" + escapeHtml(RESULT_LABELS[entry.result] || entry.result || "") + (entry.reason && entry.reason !== "ok" ? "<br><small>" + escapeHtml(REASON_LABELS[entry.reason] || entry.reason) + "</small>" : "") + (entry.error ? "<br><small>" + escapeHtml(entry.error) + "</small>" : "") + "</td><td class=num>" + (entry.elapsedMs || 0) + " ms" + (speed ? "<br><small>" + speed + "</small>" : "") + (entry.threads ? "<br><small>" + entry.threads + " 块 " + escapeHtml(usage) + "</small>" : "") + "</td></tr>";
     }).join("");
     const message = state.message ? "<div class=notice>" + escapeHtml(state.message) + "</div>" : "";
+    const auto = AUTO_REFRESH_OPTIONS.indexOf(state.autoRefresh) >= 0 ? state.autoRefresh : 0;
+    const refreshMeta = auto ? "<meta http-equiv=\"refresh\" content=\"" + auto + ";url=/?auto=" + auto + "\">" : "";
+    const refreshLinks = "<div class=sub>自动刷新：" + (auto ? "<a href=\"/\">关</a>" : "<b>关</b>") + AUTO_REFRESH_OPTIONS.map(function (seconds) {
+      return " · " + (auto === seconds ? "<b>" + seconds + " 秒</b>" : "<a href=\"/?auto=" + seconds + "\">" + seconds + " 秒</a>");
+    }).join("") + "</div>";
     const warnings = [];
     if (!capabilities.persistentStore) warnings.push("这个环境没有 $persistentStore，设置和统计都保存不了。");
     if (!capabilities.httpClient) warnings.push("这个环境没有 $httpClient，脚本无法发起下载。");
@@ -192,6 +215,7 @@
     const warningHtml = warnings.length ? "<div class=warn>" + warnings.map(escapeHtml).join("<br>") + "</div>" : "";
 
     return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      + refreshMeta
       + "<title>线程撕裂者 · 移动端设置</title>"
       + "<style>"
       + "body{margin:0;padding:16px;font:15px/1.5 -apple-system,\"PingFang SC\",\"Helvetica Neue\",sans-serif;background:#f4f5f7;color:#18191c}"
@@ -212,6 +236,7 @@
       + "</style></head><body>"
       + "<h1>Bilibili 线程撕裂者 <span class=badge" + (settings.enabled ? " on" : "") + ">" + (settings.enabled ? "已启用" : "已停用") + "</span></h1>"
       + "<div class=sub>移动端 · Shadowrocket 脚本 · 版本 " + escapeHtml(BTR.VERSION) + "</div>"
+      + refreshLinks
       + message + warningHtml
       + "<div class=card><div class=kv>"
       + "<div><small>看到的分片请求</small><b>" + stats.seen + "</b></div>"
@@ -259,6 +284,8 @@
       + "<a class=\"btn secondary\" href=\"/reset?what=stats\">清空统计</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=health\">清空节点记忆</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=env\">重新检测环境</a>"
+      + "<a class=\"btn secondary\" href=\"/log.txt\">查看日志</a>"
+      + "<a class=\"btn secondary\" href=\"/reset?what=log\">清空日志</a>"
       + "<a class=\"btn secondary\" href=\"/diag.json\">诊断 JSON</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=all\">全部重置</a>"
       + "</div>"
@@ -287,6 +314,7 @@
       if (what === "stats" || what === "all") saveStats(emptyStats());
       if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
       if (what === "env" || what === "all") saveEnvFlags({});
+      if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
       message = what ? "已重置：" + what + "。" : "没有指定要重置什么。";
     } else if (path === "/diag.json") {
       return jsonResponse({
@@ -295,8 +323,16 @@
         settings: loadSettings(),
         flags: loadEnvFlags(),
         stats: loadStats(),
-        health: BTR.accelerator.loadHealth()
+        health: BTR.accelerator.loadHealth(),
+        log: loadLog()
       });
+    } else if (path === "/log.txt") {
+      const lines = loadLog();
+      return {
+        status: 200,
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+        body: "Bilibili 线程撕裂者 · 移动端 v" + BTR.VERSION + " · 最近 " + lines.length + " 行日志（最新在最后）\n\n" + (lines.length ? lines.join("\n") : "（还没有日志。播放一个视频后再看。开调试日志能看到每块的去向。）") + "\n"
+      };
     } else if (path !== "/") {
       return htmlResponse("<!doctype html><meta charset=utf-8><p>没有这个页面。<a href=\"/\">返回设置</a></p>", 404);
     }
@@ -306,19 +342,23 @@
       health: BTR.accelerator.loadHealth(),
       flags: loadEnvFlags(),
       capabilities: env.capabilities(),
+      autoRefresh: Number(query.auto) || 0,
       message
     }));
   }
 
   BTR.settings = Object.freeze({
     ENV_KEY,
+    LOG_KEY,
     SETTINGS_HOST,
     SETTINGS_KEY,
     STATS_KEY,
     REASON_LABELS,
+    appendLog,
     emptyStats,
     handle,
     loadEnvFlags,
+    loadLog,
     loadSettings,
     loadStats,
     parseQuery,

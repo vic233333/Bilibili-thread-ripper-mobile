@@ -87,6 +87,55 @@ test("诊断 JSON 包含版本、能力、设置和统计", async () => {
   assert.equal(diag.settings.maxBytes, 8 * 1024 * 1024);
 });
 
+test("脚本日志跨运行保存，/log.txt 能看到，可清空", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    store.setJson("btr.settings", { threads: 2, debug: true });
+    const env = createEnv({ server, store });
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    await env.run(mediaRequest({ noRange: true }));
+    const { value } = await env.run(page("/log.txt"));
+    assert.equal(value.response.status, 200);
+    assert.match(value.response.headers["Content-Type"], /text\/plain/);
+    assert.match(value.response.body, /accelerated\/ok video 0-1048575/);
+    assert.match(value.response.body, /rewritten\/noRange/);
+    assert.match(value.response.body, /拆成 2 块/, "调试日志也应写入");
+    const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+    assert.ok(diag.log.length >= 2);
+    await env.run(page("/reset?what=log"));
+    assert.deepEqual(store.json("btr.log"), []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("日志最多保留 300 行", async () => {
+  const store = createStore();
+  store.setJson("btr.log", Array.from({ length: 299 }, (_, index) => `old ${index}`));
+  const env = createEnv({ server: null, store });
+  await env.run({ url: "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3/3-1-30080.m4s", method: "HEAD", headers: {} });
+  const log = store.json("btr.log");
+  assert.equal(log.length, 300);
+  assert.equal(log[0], "old 0");
+  assert.match(log[299], /passthrough\/notGet/);
+});
+
+test("设置页可选自动刷新", async () => {
+  const env = createEnv({ server: null });
+  const plain = (await env.run(page("/"))).value.response.body;
+  assert.ok(!plain.includes("http-equiv=\"refresh\""));
+  assert.ok(plain.includes("自动刷新：<b>关</b>"));
+  const auto = (await env.run(page("/?auto=15"))).value.response.body;
+  assert.ok(auto.includes("<meta http-equiv=\"refresh\" content=\"15;url=/?auto=15\">"));
+  assert.ok(auto.includes("<b>15 秒</b>"));
+  const bogus = (await env.run(page("/?auto=1"))).value.response.body;
+  assert.ok(!bogus.includes("http-equiv=\"refresh\""), "不在选项里的间隔不生效");
+});
+
 test("不存在的页面返回 404", async () => {
   const env = createEnv({ server: null });
   const { value } = await env.run(page("/nothing"));
