@@ -156,20 +156,24 @@
   }
 
   function isMeasured(record, now) {
-    return Boolean(record && record.measuredAt) && now - record.measuredAt < MEASURE_TTL_MS;
+    if (!record) return false;
+    // 整段实测比单块测量更可靠，也更值钱：有它就算测过。
+    if (record.segAt && now - record.segAt < SEGMENT_TTL_MS) return true;
+    return Boolean(record.measuredAt) && now - record.measuredAt < MEASURE_TTL_MS;
   }
 
   // 这次请求的分块先发给哪些节点。测过速度的按快慢排，再带上一个没测过的去探路；
   // 测过的不到两个时还在热身，把分块撒到所有节点上，一次就把它们都量一遍。
   // 被退避的节点排最后，只在别的都失败时才轮到。
-  function orderCandidates(hosts, health, threads) {
+  function orderCandidates(hosts, health, threads, originalHost) {
     const now = Date.now();
     const entries = hosts.map(function (host) { return { host, record: health.hosts[host] || null }; });
     const active = entries.filter(function (entry) { return !isBlocked(entry.record, now); });
     const blocked = entries.filter(function (entry) { return isBlocked(entry.record, now); })
       .sort(function (a, b) { return (a.record.blockedUntil || 0) - (b.record.blockedUntil || 0); });
+    // 按挑领跑者时用的同一把尺子排，免得一个整段成绩很好的节点因为单块记录旧了而掉出候选。
     const measured = active.filter(function (entry) { return isMeasured(entry.record, now); })
-      .sort(function (a, b) { return (b.record.bps || 0) - (a.record.bps || 0); });
+      .sort(function (a, b) { return hostScore(health, b.host, originalHost) - hostScore(health, a.host, originalHost); });
     const fresh = active.filter(function (entry) { return !isMeasured(entry.record, now); })
       .sort(function (a, b) { return (b.record && b.record.bps || 0) - (a.record && a.record.bps || 0); });
     let pool;
@@ -370,7 +374,7 @@
     const startedAt = Date.now();
     const hosts = core.candidateHosts(context.parts.host, settings);
     if (!hosts.length) throw env.makeError("NoHosts", "当前模式下没有可用的 CDN 节点");
-    const ordered = orderCandidates(hosts, context.health, settings.threads);
+    const ordered = orderCandidates(hosts, context.health, settings.threads, context.parts.host);
     const pieces = core.splitRange(context.range.start, context.range.end, settings.threads, settings.minChunkBytes);
     const plan = {
       parts: context.parts,

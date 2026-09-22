@@ -38,7 +38,7 @@
     const hosts = core.candidateHosts(parts.host, settings);
     if (!hosts.length) return pass(reason);
     // 单连接也走同一个领跑者，别让“只换节点”的请求跑到一个刚被判定为慢的节点上。
-    const host = accelerator.chooseLeader(accelerator.orderCandidates(hosts, health, settings.threads).pool, health, parts.host);
+    const host = accelerator.chooseLeader(accelerator.orderCandidates(hosts, health, settings.threads, parts.host).pool, health, parts.host);
     if (!host || host === parts.host) return pass(reason);
     const nextHeaders = {};
     Object.keys(headers || {}).forEach(function (key) {

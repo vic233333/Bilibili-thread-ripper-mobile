@@ -608,6 +608,21 @@ test("一段只用最快的那个节点；隔一阵子留一块去试没测过�
   assert.deepEqual(warm, ["fast.bilivideo.com", "near.bilivideo.com", "half.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com", "fast.bilivideo.com", "near.bilivideo.com"]);
 });
 
+test("整段成绩好的节点不会因为单块记录过期而掉出候选", async () => {
+  const BTR = await loadModules();
+  const { orderCandidates } = BTR.accelerator;
+  const now = Date.now();
+  const hosts = ["good.bilivideo.com", "thin.bilivideo.com", "new.bilivideo.com"];
+  const health = { hosts: {
+    // 整段实测很好，但单块的测速记录已经过期了。
+    "good.bilivideo.com": { segBps: 9e6, segAt: now - 60000, bps: 9e6, measuredAt: now - 3600000 },
+    "thin.bilivideo.com": { bps: 3e6, measuredAt: now }
+  } };
+  const ordered = orderCandidates(hosts, health, 6, "");
+  assert.equal(ordered.pool[0], "good.bilivideo.com", "整段实测新鲜就该排在最前");
+  assert.ok(ordered.pool.indexOf("thin.bilivideo.com") > 0);
+});
+
 test("领跑者：在位的不轻易换，明显更快的才换得掉", async () => {
   const BTR = await loadModules();
   const { chooseLeader, hostScore } = BTR.accelerator;
