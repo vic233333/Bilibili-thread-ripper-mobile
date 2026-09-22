@@ -32,7 +32,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
   assert.equal(value.response.headers.Location, "http://btr.settings/?done=saved");
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
-    revision: 5,
+    revision: 6,
     enabled: true,
     accelerate: "split",
     mode: "custom",
@@ -118,7 +118,7 @@ test("全部重置把设置也恢复成默认值", async () => {
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=all"));
   assert.equal(value.response.status, 302);
-  assert.deepEqual(store.json("btr.settings"), { revision: 5 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 6 });
   assert.deepEqual(store.json("btr.busy"), {});
   assert.deepEqual(store.json("btr.lastMedia"), {});
   const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
@@ -137,7 +137,7 @@ test("恢复默认设置只动设置，统计和节点记忆留着", async () =>
   const { value } = await env.run(page("/reset?what=settings"));
   assert.equal(value.response.status, 302);
   assert.ok((await env.run(page("/?done=reset&what=settings"))).value.response.body.includes("恢复默认"));
-  assert.deepEqual(store.json("btr.settings"), { revision: 5 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 6 });
   assert.equal(store.json("btr.stats").seen, 9);
   assert.ok(store.json("btr.health").hosts["upos-sz-mirrorali.bilivideo.com"]);
 });
@@ -146,7 +146,7 @@ test("第 4 版保存的旧时限让位给新默认值，用户自己改过的�
   const stale = createStore();
   stale.setJson("btr.settings", { revision: 4, deadlineSec: 10, attemptTimeoutSec: 6 });
   let diag = JSON.parse((await createEnv({ server: null, store: stale }).run(page("/diag.json"))).value.response.body);
-  assert.equal(diag.settings.deadlineSec, 3, "10 秒是第 4 版的默认值，不是用户的选择");
+  assert.equal(diag.settings.deadlineSec, 8, "10 秒是第 4 版的默认值，不是用户的选择");
   assert.equal(diag.settings.attemptTimeoutSec, 4);
   const chosen = createStore();
   chosen.setJson("btr.settings", { revision: 4, deadlineSec: 25, attemptTimeoutSec: 8 });
@@ -659,6 +659,47 @@ test("领跑者：在位的不轻易换，明显更快的才换得掉", async ()
   assert.equal(chooseLeader(pool, tie, "akam.akamaized.net"), "akam.akamaized.net");
 });
 
+test("领跑位默认留给 App 自己的节点，一次抽风也打不垮它", async () => {
+  const BTR = await loadModules();
+  const { chooseLeader, markSlow, markSuccess } = BTR.accelerator;
+  const now = Date.now();
+  const app = "akam.akamaized.net";
+  const pool = [app, "hk.bilivideo.com", "ali.bilivideo.com"];
+
+  // 别人测得更快，但只是快一点：留在 App 的节点上。
+  const better = { hosts: {
+    [app]: { segBps: 3e6, segAt: now },
+    "hk.bilivideo.com": { segBps: 7e6, segAt: now }
+  } };
+  assert.equal(chooseLeader(pool, better, app), app);
+
+  // App 的节点还没有任何记录：也留在它身上，没有理由先怀疑它。
+  const blank = { hosts: { "hk.bilivideo.com": { segBps: 9e6, segAt: now } } };
+  assert.equal(chooseLeader(pool, blank, app), app);
+
+  // 它自己实测很慢，别人快三倍以上：这才换。
+  const slow = { hosts: {
+    [app]: { segBps: 3e5, segAt: now },
+    "hk.bilivideo.com": { segBps: 2e6, segAt: now }
+  } };
+  assert.equal(chooseLeader(pool, slow, app), "hk.bilivideo.com");
+
+  // 它被退避时立刻换人。
+  const blocked = { hosts: {
+    [app]: { segBps: 9e6, segAt: now, blockedUntil: now + 30000 },
+    "hk.bilivideo.com": { segBps: 1e6, segAt: now }
+  } };
+  assert.equal(chooseLeader(pool, blocked, app), "hk.bilivideo.com");
+
+  // 整条链路抽风时每个节点都会吃到悲观采样，但一次最多打到四分之一，
+  // 不至于把所有记忆变成废墟、让谁先侥幸成功谁就上位。
+  const storm = { hosts: {} };
+  markSuccess(storm, app, 1048576, 100);
+  const peak = storm.hosts[app].bps;
+  markSlow(storm, app, 174763, 2000);
+  assert.ok(storm.hosts[app].bps >= peak / 4 - 1, "一次观测最多打到四分之一");
+});
+
 test("记分跌得快涨得慢，崩掉的节点一两段就让位", async () => {
   const BTR = await loadModules();
   const { markSuccess, markSegment, chooseLeader } = BTR.accelerator;
@@ -726,7 +767,7 @@ test("副本等待时间按这块派给的那个节点自己的块耗时来估",
   const piece = { index: 0, length: 174763 };
   assert.equal(hedgeDelayMs(plan, piece), 400, "快节点：按它自己的 90 毫秒估，落到 400 毫秒下限");
   const other = hedgeDelayMs(plan, { index: 1, length: 174763 });
-  assert.ok(other > 2000 && other <= 2500, "慢节点：别急着开副本，它本来就要这么久 " + other);
+  assert.ok(other > 1000 && other <= 1500, "慢节点：等久一点，但封顶，否则副本永远开不出来 " + other);
   // 试探块单独一档，最多拖半秒多一点。
   const trial = hedgeDelayMs(plan, { index: 1, length: 174763, trial: true });
   assert.ok(trial >= 300 && trial <= 700, "试探块 " + trial);

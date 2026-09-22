@@ -48,7 +48,7 @@
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 5;
+  const SETTINGS_REVISION = 6;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -62,6 +62,8 @@
     // 第 5 版：总时限 10 → 3 秒，单块尝试 6 → 4 秒。
     if (revision < 5 && Number(raw.deadlineSec) === 10) delete raw.deadlineSec;
     if (revision < 5 && Number(raw.attemptTimeoutSec) === 6) delete raw.attemptTimeoutSec;
+    // 第 6 版：总时限 3 → 8 秒。3 秒是个错误，一次失败就没有重试的余地了。
+    if (revision < 6 && Number(raw.deadlineSec) === 3) delete raw.deadlineSec;
     return core.normalizeSettings(raw);
   }
 

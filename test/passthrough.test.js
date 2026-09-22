@@ -18,13 +18,28 @@ async function runWith(request, settings) {
   return { env, value: result.value, stats: env.store.json("btr.stats") };
 }
 
-test("自动模式且没有测速数据时，不拆分的请求原样放过；有数据后改走最快的节点", async () => {
+test("自动模式下留在 App 自己的节点上，除非别人快三倍以上", async () => {
   const noData = await runWith(mediaRequest({ noRange: true }));
   assert.deepEqual(noData.value, {}, "不知道谁快就别乱换");
+
+  // 别的节点测出速度了，但 App 原本那个节点没有任何坏记录：不换。换过去要重新握手，
+  // 而它的连接一直被 App 自己用着，是热的。
   const store = createStore();
-  store.setJson("btr.health", { hosts: { "upos-sz-mirrorcosov.bilivideo.com": { bps: 320000, measuredAt: Date.now() }, "upos-sz-mirrorali.bilivideo.com": { bps: 200000, measuredAt: Date.now() } } });
-  const env = createEnv({ server, store });
-  const { value } = await env.run(mediaRequest({ noRange: true }));
+  const now = Date.now();
+  store.setJson("btr.health", { hosts: {
+    "upos-sz-mirrorcosov.bilivideo.com": { bps: 320000, measuredAt: now },
+    "upos-sz-mirrorali.bilivideo.com": { bps: 200000, measuredAt: now }
+  } });
+  assert.deepEqual((await createEnv({ server, store }).run(mediaRequest({ noRange: true }))).value, {},
+    "原节点没坏记录就留在它身上");
+
+  // 原节点自己测出来很慢，而且别人快三倍以上：这才换。
+  const slow = createStore();
+  slow.setJson("btr.health", { hosts: {
+    "upos-hz-mirrorakam.akamaized.net": { segBps: 100000, segAt: now, bps: 100000, measuredAt: now },
+    "upos-sz-mirrorcosov.bilivideo.com": { segBps: 2000000, segAt: now, bps: 2000000, measuredAt: now }
+  } });
+  const { value } = await createEnv({ server, store: slow }).run(mediaRequest({ noRange: true }));
   assert.equal(new URL(value.url).host, "upos-sz-mirrorcosov.bilivideo.com");
 });
 

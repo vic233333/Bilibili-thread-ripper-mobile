@@ -162,9 +162,10 @@
       // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
       overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 2, 30, 4)),
-      // 真机实测：App 从发出请求到重发同一段，中位数正好 3 秒。拖过这个点再拼好也没人要了，
-      // 还白占着全局在途的名额，不如早点原样交回去，让 App 自己去它的节点拿。
-      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 3)),
+      // 曾经按「App 三秒就重发」把这里压到 3 秒，真机上直接翻车：环境自己的连接超时就要两秒，
+      // 一次失败之后预算只剩不到一秒，连换个节点重试的机会都没有，于是整段直接放弃。
+      // 0.6.0 的失败率因此从 3% 涨到 44%。预算要够试三四次。
+      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 8)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },

@@ -89,7 +89,10 @@
     const bound = bytes * 1000 / elapsedMs;
     // 上界比现有记录还宽，说明还谈不上慢，不记。
     if (record.bps > 0 && bound >= record.bps) return false;
-    record.bps = blend(record.bps, bound);
+    // 一次观测最多把分数打到四分之一。整条链路抽风的时候每个节点都会吃到这一笔，
+    // 要是允许一次就清零，抽风过后所有节点的记忆都成了废墟，谁先侥幸成功谁就当领跑者。
+    const floor = record.bps > 0 ? record.bps / 4 : 0;
+    record.bps = Math.max(blend(record.bps, bound), floor);
     record.pieceMs = blendMs(record.pieceMs, elapsedMs);
     record.measuredAt = Date.now();
     return true;
@@ -123,6 +126,13 @@
     return base * (host && host === originalHost ? ORIGINAL_BONUS : 1);
   }
 
+  // App 自己那个节点是首选。真机数据反复指向同一件事：它是 B 站按这台设备调度出来的，
+  // App 自己的请求（音轨、太小的段、放过的段）一直在用它，连接常年是热的；我们换过去的节点
+  // 每次都要重新握手，换帅后的第一段平均多花一秒半。0.6.0 一度把领跑位让给香港节点并在那里
+  // 待了四分半，每段 3 秒多，而同期 akamai 只要 130 毫秒。所以除非它被退避，或者别人有新鲜的
+  // 整段实测而且快上三倍，否则就留在它身上。
+  const ORIGINAL_STAY_MARGIN = 3;
+
   // 这一段交给谁。在位的领跑者一直留任，除非有节点明显更快、或者它自己被退避了。
   function chooseLeader(pool, health, originalHost) {
     if (!pool.length) return "";
@@ -133,6 +143,17 @@
       return hostScore(health, b, originalHost) - hostScore(health, a, originalHost);
     });
     const best = ranked[0];
+    // App 原本那个节点还能用，就用它。
+    if (originalHost && ranked.indexOf(originalHost) >= 0) {
+      const mine = hostScore(health, originalHost, "");
+      const rival = best === originalHost ? "" : best;
+      const rivalScore = rival ? hostScore(health, rival, "") : 0;
+      if (!(mine > 0) || !(rivalScore > mine * ORIGINAL_STAY_MARGIN)) {
+        health.leader = originalHost;
+        health.leaderAt = now;
+        return originalHost;
+      }
+    }
     const held = health.leader;
     const incumbent = held && pool.indexOf(held) >= 0 && !isBlocked(health.hosts[held], now) ? held : "";
     if (!incumbent) {
@@ -288,7 +309,7 @@
     }
     // 试探用的那块：最多让它拖半秒，之后就让领跑者也下一份。
     if (piece.trial) return estimate ? Math.max(300, Math.min(700, estimate)) : 600;
-    return estimate ? Math.max(400, Math.min(2500, estimate)) : 1200;
+    return estimate ? Math.max(400, Math.min(1500, estimate)) : 1200;
   }
 
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。

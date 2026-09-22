@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.6.0
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.7.0
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.6.0" };
+const BTR = { VERSION: "0.7.0" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -178,9 +178,10 @@ const BTR = { VERSION: "0.6.0" };
       // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
       overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 2, 30, 4)),
-      // 真机实测：App 从发出请求到重发同一段，中位数正好 3 秒。拖过这个点再拼好也没人要了，
-      // 还白占着全局在途的名额，不如早点原样交回去，让 App 自己去它的节点拿。
-      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 3)),
+      // 曾经按「App 三秒就重发」把这里压到 3 秒，真机上直接翻车：环境自己的连接超时就要两秒，
+      // 一次失败之后预算只剩不到一秒，连换个节点重试的机会都没有，于是整段直接放弃。
+      // 0.6.0 的失败率因此从 3% 涨到 44%。预算要够试三四次。
+      deadlineSec: Math.round(clamp(source.deadlineSec, 2, 40, 8)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },
@@ -595,7 +596,10 @@ const BTR = { VERSION: "0.6.0" };
     const bound = bytes * 1000 / elapsedMs;
     // 上界比现有记录还宽，说明还谈不上慢，不记。
     if (record.bps > 0 && bound >= record.bps) return false;
-    record.bps = blend(record.bps, bound);
+    // 一次观测最多把分数打到四分之一。整条链路抽风的时候每个节点都会吃到这一笔，
+    // 要是允许一次就清零，抽风过后所有节点的记忆都成了废墟，谁先侥幸成功谁就当领跑者。
+    const floor = record.bps > 0 ? record.bps / 4 : 0;
+    record.bps = Math.max(blend(record.bps, bound), floor);
     record.pieceMs = blendMs(record.pieceMs, elapsedMs);
     record.measuredAt = Date.now();
     return true;
@@ -629,6 +633,13 @@ const BTR = { VERSION: "0.6.0" };
     return base * (host && host === originalHost ? ORIGINAL_BONUS : 1);
   }
 
+  // App 自己那个节点是首选。真机数据反复指向同一件事：它是 B 站按这台设备调度出来的，
+  // App 自己的请求（音轨、太小的段、放过的段）一直在用它，连接常年是热的；我们换过去的节点
+  // 每次都要重新握手，换帅后的第一段平均多花一秒半。0.6.0 一度把领跑位让给香港节点并在那里
+  // 待了四分半，每段 3 秒多，而同期 akamai 只要 130 毫秒。所以除非它被退避，或者别人有新鲜的
+  // 整段实测而且快上三倍，否则就留在它身上。
+  const ORIGINAL_STAY_MARGIN = 3;
+
   // 这一段交给谁。在位的领跑者一直留任，除非有节点明显更快、或者它自己被退避了。
   function chooseLeader(pool, health, originalHost) {
     if (!pool.length) return "";
@@ -639,6 +650,17 @@ const BTR = { VERSION: "0.6.0" };
       return hostScore(health, b, originalHost) - hostScore(health, a, originalHost);
     });
     const best = ranked[0];
+    // App 原本那个节点还能用，就用它。
+    if (originalHost && ranked.indexOf(originalHost) >= 0) {
+      const mine = hostScore(health, originalHost, "");
+      const rival = best === originalHost ? "" : best;
+      const rivalScore = rival ? hostScore(health, rival, "") : 0;
+      if (!(mine > 0) || !(rivalScore > mine * ORIGINAL_STAY_MARGIN)) {
+        health.leader = originalHost;
+        health.leaderAt = now;
+        return originalHost;
+      }
+    }
     const held = health.leader;
     const incumbent = held && pool.indexOf(held) >= 0 && !isBlocked(health.hosts[held], now) ? held : "";
     if (!incumbent) {
@@ -794,7 +816,7 @@ const BTR = { VERSION: "0.6.0" };
     }
     // 试探用的那块：最多让它拖半秒，之后就让领跑者也下一份。
     if (piece.trial) return estimate ? Math.max(300, Math.min(700, estimate)) : 600;
-    return estimate ? Math.max(400, Math.min(2500, estimate)) : 1200;
+    return estimate ? Math.max(400, Math.min(1500, estimate)) : 1200;
   }
 
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
@@ -1099,7 +1121,7 @@ const BTR = { VERSION: "0.6.0" };
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 5;
+  const SETTINGS_REVISION = 6;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -1113,6 +1135,8 @@ const BTR = { VERSION: "0.6.0" };
     // 第 5 版：总时限 10 → 3 秒，单块尝试 6 → 4 秒。
     if (revision < 5 && Number(raw.deadlineSec) === 10) delete raw.deadlineSec;
     if (revision < 5 && Number(raw.attemptTimeoutSec) === 6) delete raw.attemptTimeoutSec;
+    // 第 6 版：总时限 3 → 8 秒。3 秒是个错误，一次失败就没有重试的余地了。
+    if (revision < 6 && Number(raw.deadlineSec) === 3) delete raw.deadlineSec;
     return core.normalizeSettings(raw);
   }
 
