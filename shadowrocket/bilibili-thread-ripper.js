@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.4
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.5
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.4" };
+const BTR = { VERSION: "0.1.5" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -667,8 +667,10 @@ const BTR = { VERSION: "0.1.4" };
         fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
           running -= 1;
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
+          env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + Math.round(result.bytes.byteLength / result.elapsedMs) + "KB/s" + (settled ? "（副本落败）" : ""));
           if (settled) return;
           plan.usage[host] = (plan.usage[host] || 0) + 1;
+          plan.pieceMs.push(result.elapsedMs);
           result.host = host;
           finish(true, result);
         }, function (error) {
@@ -717,6 +719,7 @@ const BTR = { VERSION: "0.1.4" };
       usage: {},
       attempts: 0,
       hedges: 0,
+      pieceMs: [],
       attemptBudget: pieces.length * 3,
       // 每块最多同时几份副本。脚本环境一次最多约 20 个并发请求，线程多时就不开副本。
       hedgeMax: settings.threads <= 10 ? 2 : 1,
@@ -753,8 +756,27 @@ const BTR = { VERSION: "0.1.4" };
       usage: plan.usage,
       attempts: plan.attempts,
       hedges: plan.hedges,
+      pieceMsMin: plan.pieceMs.length ? Math.min.apply(null, plan.pieceMs) : 0,
+      pieceMsMax: plan.pieceMs.length ? Math.max.apply(null, plan.pieceMs) : 0,
       elapsedMs: Math.max(1, Date.now() - startedAt)
     };
+  }
+
+  // 节点测速：用一个真实的签名地址，向指定节点单连接下一段，返回速度。设置页的测速表用它。
+  async function probeHost(mediaUrl, host, headers, bytes, timeoutSec, health) {
+    const parts = core.parseUrl(mediaUrl);
+    if (!parts) throw env.makeError("BadUrl", "没有可用的视频地址");
+    const url = core.buildUrl(parts, { host, port: "" });
+    const piece = { index: 0, start: 0, end: Math.max(1, bytes) - 1, length: Math.max(1, bytes) };
+    const startedAt = Date.now();
+    try {
+      const result = await fetchPiece(url, piece, headers, timeoutSec);
+      if (health) markSuccess(health, host, result.bytes.byteLength, result.elapsedMs);
+      return { host, ok: true, bytes: result.bytes.byteLength, elapsedMs: result.elapsedMs, bps: Math.round(result.bytes.byteLength * 1000 / result.elapsedMs) };
+    } catch (error) {
+      if (health && error && HOST_ERRORS.indexOf(error.name) >= 0) markFailure(health, host, error);
+      return { host, ok: false, elapsedMs: Date.now() - startedAt, error: env.safeString(error).slice(0, 120) };
+    }
   }
 
   BTR.accelerator = Object.freeze({
@@ -765,6 +787,7 @@ const BTR = { VERSION: "0.1.4" };
     markFailure,
     markSuccess,
     orderCandidates,
+    probeHost,
     saveHealth
   });
 })(BTR);
@@ -783,6 +806,14 @@ const BTR = { VERSION: "0.1.4" };
   const STATS_KEY = "btr.stats";
   const ENV_KEY = "btr.env";
   const LOG_KEY = "btr.log";
+  // 最近一次看到的视频分片地址（带签名）。只存在本机的持久存储里给测速用，两小时后作废；
+  // 不进日志、不进诊断 JSON。
+  const LAST_MEDIA_KEY = "btr.lastMedia";
+  const LAST_MEDIA_TTL_MS = 2 * 60 * 60 * 1000;
+  // 播放器等不到三秒就会重发同一段请求。刚开始拆的那段还没拼完时又来一份，第二份不再拆，
+  // 单连接改走最快的节点，免得两份一起抢带宽。
+  const INFLIGHT_KEY = "btr.inflight";
+  const INFLIGHT_TTL_MS = 12 * 1000;
   const RECENT_LIMIT = 12;
   const LOG_LIMIT = 300;
   const AUTO_REFRESH_OPTIONS = [5, 15, 30];
@@ -868,6 +899,43 @@ const BTR = { VERSION: "0.1.4" };
     return env.store.writeJson(LOG_KEY, log);
   }
 
+  function rememberMedia(url, userAgent) {
+    return env.store.writeJson(LAST_MEDIA_KEY, { url, userAgent: userAgent || "", at: Date.now() });
+  }
+
+  function loadLastMedia() {
+    const stored = env.store.readJson(LAST_MEDIA_KEY, null);
+    if (!stored || typeof stored.url !== "string" || Date.now() - (stored.at || 0) > LAST_MEDIA_TTL_MS) return null;
+    return stored;
+  }
+
+  function loadInflight() {
+    const stored = env.store.readJson(INFLIGHT_KEY, null);
+    const now = Date.now();
+    const output = {};
+    if (stored && typeof stored === "object") {
+      Object.keys(stored).forEach(function (key) {
+        if (now - (Number(stored[key]) || 0) < INFLIGHT_TTL_MS) output[key] = stored[key];
+      });
+    }
+    return output;
+  }
+
+  // 返回 true 表示同一段已经在拆了。
+  function claimInflight(key) {
+    const inflight = loadInflight();
+    if (inflight[key]) return true;
+    inflight[key] = Date.now();
+    env.store.writeJson(INFLIGHT_KEY, inflight);
+    return false;
+  }
+
+  function releaseInflight(key) {
+    const inflight = loadInflight();
+    delete inflight[key];
+    env.store.writeJson(INFLIGHT_KEY, inflight);
+  }
+
   function loadEnvFlags() {
     const stored = env.store.readJson(ENV_KEY, null);
     return stored && typeof stored === "object" ? stored : {};
@@ -947,6 +1015,7 @@ const BTR = { VERSION: "0.1.4" };
     unsupportedRange: "不支持的 Range 写法",
     tooSmall: "区间太小，不值得拆",
     tooLarge: "区间超过上限",
+    duplicate: "同一段还在拆，重发的这份不再拆",
     splitOff: "设置为只换节点",
     binaryUnsupported: "环境不支持二进制响应",
     failed: "多线程下载失败，已交回原连接",
@@ -1064,6 +1133,7 @@ const BTR = { VERSION: "0.1.4" };
       + "<a class=\"btn secondary\" href=\"/reset?what=stats\">清空统计</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=health\">清空节点记忆</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=env\">重新检测环境</a>"
+      + "<a class=\"btn secondary\" href=\"/speedtest\">节点测速</a>"
       + "<a class=\"btn secondary\" href=\"/log.txt\">查看日志</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=log\">清空日志</a>"
       + "<a class=\"btn secondary\" href=\"/diag.json\">诊断 JSON</a>"
@@ -1071,6 +1141,45 @@ const BTR = { VERSION: "0.1.4" };
       + "</div>"
       + "<div class=sub style=\"margin:20px 0\">这个页面由脚本本地生成，不联网。地址栏里的 btr.settings 不是真实域名。<br>原作：<a href=\"https://github.com/MrTangLuyao/Bilibili-thread-ripper\">MrTangLuyao/Bilibili-thread-ripper</a>（MIT）。移植：<a href=\"https://github.com/vic233333/Bilibili-thread-ripper-mobile\">vic233333/Bilibili-thread-ripper-mobile</a>。</div>"
       + "</body></html>";
+  }
+
+  // 测速页：每个节点一行，页面里的脚本逐个请求 /speedtest/run?host=…，把结果填进表格。
+  // 每次 run 都是一次独立的脚本运行，不会撞上设置页脚本的 10 秒时限。
+  function renderSpeedtest(settings, lastMedia) {
+    const original = lastMedia ? core.parseUrl(lastMedia.url) : null;
+    const hosts = [];
+    if (original) hosts.push(original.host);
+    core.MAINLAND_HOSTS.concat(core.OVERSEAS_HOSTS, settings.customHosts).forEach(function (host) { if (hosts.indexOf(host) < 0) hosts.push(host); });
+    const rows = hosts.map(function (host) {
+      const label = original && host === original.host ? "<br><small>App 原本用的节点（基线）</small>" : core.MAINLAND_HOSTS.indexOf(host) >= 0 ? "<br><small>大陆</small>" : core.OVERSEAS_HOSTS.indexOf(host) >= 0 ? "<br><small>海外</small>" : "<br><small>自定义</small>";
+      return "<tr data-host=\"" + escapeHtml(host) + "\"><td class=host>" + escapeHtml(host) + label + "</td><td class=num data-cell=ms>-</td><td class=num data-cell=speed>-</td><td data-cell=note>等待</td></tr>";
+    }).join("");
+    const body = !original
+      ? "<div class=warn>还没有可用的视频地址。先在 B 站 App 里播放一个视频，再回到这里。地址两小时内有效。</div>"
+      : "<div class=sub>用最近一次视频的地址，向每个节点单连接下载 256 KiB，逐个进行，约需一两分钟。第一行是 App 原本用的节点，其余是脚本会换到的节点。测速也会更新“节点记忆”里的速度。</div>"
+        + "<table><tr><th>节点</th><th>耗时</th><th>速度</th><th>结果</th></tr>" + rows + "</table>"
+        + "<button id=again type=button style=\"margin-top:12px\">再测一次</button>"
+        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
+        + "function run(i){if(i>=rows.length){btn.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
+        + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes=262144',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.ok?fmt(d.bps):'-';row.querySelector('[data-cell=note]').textContent=d.ok?'正常':(d.error||'失败');}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
+        + "btn.addEventListener('click',function(){btn.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});btn.disabled=true;run(0);})();</script>";
+    return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>节点测速</title>"
+      + "<style>body{margin:0;padding:16px;font:15px/1.5 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}h1{font-size:20px;margin:0 0 8px}.sub{color:#61666d;font-size:13px;margin-bottom:12px}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:12px}th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500}td.num{text-align:right;white-space:nowrap}td.host{word-break:break-all}small{color:#9499a0}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:10px;background:#fb7299;color:#fff}button:disabled{opacity:.5}a{color:#fb7299}</style></head><body>"
+      + "<h1>节点测速</h1><div class=sub><a href=\"/\">← 返回设置</a></div>" + body + "</body></html>";
+  }
+
+  async function runSpeedtest(query) {
+    const lastMedia = loadLastMedia();
+    const host = core.normalizeCdnHost(query.host);
+    if (!lastMedia) return jsonResponse({ ok: false, error: "还没有可用的视频地址，先播放一个视频" });
+    if (!host) return jsonResponse({ ok: false, error: "节点名不合法" });
+    const bytes = Math.max(64 * 1024, Math.min(2 * 1024 * 1024, Math.trunc(Number(query.bytes)) || 256 * 1024));
+    const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1" };
+    if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
+    const health = BTR.accelerator.loadHealth();
+    const result = await BTR.accelerator.probeHost(lastMedia.url, host, headers, bytes, 8, health);
+    BTR.accelerator.saveHealth(health);
+    return jsonResponse(result);
   }
 
   function htmlResponse(body, status) {
@@ -1081,11 +1190,13 @@ const BTR = { VERSION: "0.1.4" };
     return { status: 200, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }, body: JSON.stringify(value, null, 2) };
   }
 
-  // 返回 { status, headers, body }，交给 $done({ response })。
+  // 返回 { status, headers, body } 或它的 Promise，交给 $done({ response })。
   function handle(parts) {
     const query = parseQuery(parts.query);
     const path = (parts.path || "/").replace(/\/+$/, "") || "/";
     let message = "";
+    if (path === "/speedtest") return htmlResponse(renderSpeedtest(loadSettings(), loadLastMedia()));
+    if (path === "/speedtest/run") return runSpeedtest(query);
     if (path === "/save") {
       const next = settingsFromQuery(query);
       message = saveSettings(next) ? "设置已保存。" : "设置保存失败：这个环境没有可用的 $persistentStore。";
@@ -1095,6 +1206,7 @@ const BTR = { VERSION: "0.1.4" };
       if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
       if (what === "env" || what === "all") saveEnvFlags({});
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
+      if (what === "all") { env.store.writeJson(LAST_MEDIA_KEY, {}); env.store.writeJson(INFLIGHT_KEY, {}); }
       message = what ? "已重置：" + what + "。" : "没有指定要重置什么。";
     } else if (path === "/diag.json") {
       return jsonResponse({
@@ -1135,10 +1247,14 @@ const BTR = { VERSION: "0.1.4" };
     STATS_KEY,
     REASON_LABELS,
     appendLog,
+    claimInflight,
     emptyStats,
     handle,
     loadEnvFlags,
+    loadLastMedia,
     loadLog,
+    releaseInflight,
+    rememberMedia,
     loadSettings,
     loadStats,
     parseQuery,
@@ -1207,6 +1323,8 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     if (!settings.enabled) return pass("disabled");
     if (method !== "GET") return pass("notGet");
     if (!core.isMediaUrl(parts) || !core.isUposPath(parts)) return pass("notMedia");
+    // 给设置页的节点测速留一个真实地址。只存在本机。
+    settingsModule.rememberMedia(parts.href, core.headerGet(headers, "user-agent"));
     const range = core.parseRangeHeader(core.headerGet(headers, "range"));
     entry.range = range.kind === "bounded" ? range.start + "-" + range.end : (range.raw || "(无)").slice(0, 40);
     if (range.kind === "bounded") entry.length = range.length;
@@ -1220,13 +1338,18 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     if (range.kind !== "bounded") return single(range.kind === "none" ? "noRange" : range.kind === "open" ? "openRange" : "unsupportedRange");
     if (range.length > settings.maxBytes) return single("tooLarge");
     if (range.length < settings.minSplitBytes) return single("tooSmall");
+    const inflightKey = parts.path + "#" + range.start + "-" + range.end;
+    if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     try {
       const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings, health });
+      settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.threads = download.pieces;
       entry.hosts = download.usage;
       entry.attempts = download.attempts;
       entry.hedges = download.hedges;
+      entry.pieceMsMin = download.pieceMsMin;
+      entry.pieceMsMax = download.pieceMsMax;
       const responseHeaders = {
         "Content-Type": download.contentType || "video/mp4",
         "Content-Range": "bytes " + range.start + "-" + range.end + "/" + (download.total === null ? "*" : download.total),
@@ -1237,6 +1360,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       };
       return { result: "accelerated", reason: "ok", done: { response: { status: 206, headers: responseHeaders, body: download.bytes } } };
     } catch (error) {
+      settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.error = env.safeString(error).slice(0, 120);
       if (error && error.name === "BinaryUnsupported") {
@@ -1264,7 +1388,8 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       return;
     }
     if (parts.host === settingsModule.SETTINGS_HOST) {
-      env.finish({ response: settingsModule.handle(parts) });
+      const response = await settingsModule.handle(parts);
+      env.finish({ response });
       return;
     }
     const headers = request.headers && typeof request.headers === "object" ? request.headers : {};
@@ -1307,7 +1432,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
+      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
       : entry.rewrittenTo || entry.error || "";
     env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }

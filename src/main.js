@@ -52,6 +52,8 @@
     if (!settings.enabled) return pass("disabled");
     if (method !== "GET") return pass("notGet");
     if (!core.isMediaUrl(parts) || !core.isUposPath(parts)) return pass("notMedia");
+    // 给设置页的节点测速留一个真实地址。只存在本机。
+    settingsModule.rememberMedia(parts.href, core.headerGet(headers, "user-agent"));
     const range = core.parseRangeHeader(core.headerGet(headers, "range"));
     entry.range = range.kind === "bounded" ? range.start + "-" + range.end : (range.raw || "(无)").slice(0, 40);
     if (range.kind === "bounded") entry.length = range.length;
@@ -65,13 +67,18 @@
     if (range.kind !== "bounded") return single(range.kind === "none" ? "noRange" : range.kind === "open" ? "openRange" : "unsupportedRange");
     if (range.length > settings.maxBytes) return single("tooLarge");
     if (range.length < settings.minSplitBytes) return single("tooSmall");
+    const inflightKey = parts.path + "#" + range.start + "-" + range.end;
+    if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
     try {
       const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings, health });
+      settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.threads = download.pieces;
       entry.hosts = download.usage;
       entry.attempts = download.attempts;
       entry.hedges = download.hedges;
+      entry.pieceMsMin = download.pieceMsMin;
+      entry.pieceMsMax = download.pieceMsMax;
       const responseHeaders = {
         "Content-Type": download.contentType || "video/mp4",
         "Content-Range": "bytes " + range.start + "-" + range.end + "/" + (download.total === null ? "*" : download.total),
@@ -82,6 +89,7 @@
       };
       return { result: "accelerated", reason: "ok", done: { response: { status: 206, headers: responseHeaders, body: download.bytes } } };
     } catch (error) {
+      settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.error = env.safeString(error).slice(0, 120);
       if (error && error.name === "BinaryUnsupported") {
@@ -109,7 +117,8 @@
       return;
     }
     if (parts.host === settingsModule.SETTINGS_HOST) {
-      env.finish({ response: settingsModule.handle(parts) });
+      const response = await settingsModule.handle(parts);
+      env.finish({ response });
       return;
     }
     const headers = request.headers && typeof request.headers === "object" ? request.headers : {};
@@ -152,7 +161,7 @@
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
     const detail = entry.hosts
-      ? JSON.stringify(entry.hosts) + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
+      ? JSON.stringify(entry.hosts) + " 块耗时 " + entry.pieceMsMin + "~" + entry.pieceMsMax + "ms" + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
       : entry.rewrittenTo || entry.error || "";
     env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }

@@ -11,6 +11,14 @@
   const STATS_KEY = "btr.stats";
   const ENV_KEY = "btr.env";
   const LOG_KEY = "btr.log";
+  // 最近一次看到的视频分片地址（带签名）。只存在本机的持久存储里给测速用，两小时后作废；
+  // 不进日志、不进诊断 JSON。
+  const LAST_MEDIA_KEY = "btr.lastMedia";
+  const LAST_MEDIA_TTL_MS = 2 * 60 * 60 * 1000;
+  // 播放器等不到三秒就会重发同一段请求。刚开始拆的那段还没拼完时又来一份，第二份不再拆，
+  // 单连接改走最快的节点，免得两份一起抢带宽。
+  const INFLIGHT_KEY = "btr.inflight";
+  const INFLIGHT_TTL_MS = 12 * 1000;
   const RECENT_LIMIT = 12;
   const LOG_LIMIT = 300;
   const AUTO_REFRESH_OPTIONS = [5, 15, 30];
@@ -96,6 +104,43 @@
     return env.store.writeJson(LOG_KEY, log);
   }
 
+  function rememberMedia(url, userAgent) {
+    return env.store.writeJson(LAST_MEDIA_KEY, { url, userAgent: userAgent || "", at: Date.now() });
+  }
+
+  function loadLastMedia() {
+    const stored = env.store.readJson(LAST_MEDIA_KEY, null);
+    if (!stored || typeof stored.url !== "string" || Date.now() - (stored.at || 0) > LAST_MEDIA_TTL_MS) return null;
+    return stored;
+  }
+
+  function loadInflight() {
+    const stored = env.store.readJson(INFLIGHT_KEY, null);
+    const now = Date.now();
+    const output = {};
+    if (stored && typeof stored === "object") {
+      Object.keys(stored).forEach(function (key) {
+        if (now - (Number(stored[key]) || 0) < INFLIGHT_TTL_MS) output[key] = stored[key];
+      });
+    }
+    return output;
+  }
+
+  // 返回 true 表示同一段已经在拆了。
+  function claimInflight(key) {
+    const inflight = loadInflight();
+    if (inflight[key]) return true;
+    inflight[key] = Date.now();
+    env.store.writeJson(INFLIGHT_KEY, inflight);
+    return false;
+  }
+
+  function releaseInflight(key) {
+    const inflight = loadInflight();
+    delete inflight[key];
+    env.store.writeJson(INFLIGHT_KEY, inflight);
+  }
+
   function loadEnvFlags() {
     const stored = env.store.readJson(ENV_KEY, null);
     return stored && typeof stored === "object" ? stored : {};
@@ -175,6 +220,7 @@
     unsupportedRange: "不支持的 Range 写法",
     tooSmall: "区间太小，不值得拆",
     tooLarge: "区间超过上限",
+    duplicate: "同一段还在拆，重发的这份不再拆",
     splitOff: "设置为只换节点",
     binaryUnsupported: "环境不支持二进制响应",
     failed: "多线程下载失败，已交回原连接",
@@ -292,6 +338,7 @@
       + "<a class=\"btn secondary\" href=\"/reset?what=stats\">清空统计</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=health\">清空节点记忆</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=env\">重新检测环境</a>"
+      + "<a class=\"btn secondary\" href=\"/speedtest\">节点测速</a>"
       + "<a class=\"btn secondary\" href=\"/log.txt\">查看日志</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=log\">清空日志</a>"
       + "<a class=\"btn secondary\" href=\"/diag.json\">诊断 JSON</a>"
@@ -299,6 +346,45 @@
       + "</div>"
       + "<div class=sub style=\"margin:20px 0\">这个页面由脚本本地生成，不联网。地址栏里的 btr.settings 不是真实域名。<br>原作：<a href=\"https://github.com/MrTangLuyao/Bilibili-thread-ripper\">MrTangLuyao/Bilibili-thread-ripper</a>（MIT）。移植：<a href=\"https://github.com/vic233333/Bilibili-thread-ripper-mobile\">vic233333/Bilibili-thread-ripper-mobile</a>。</div>"
       + "</body></html>";
+  }
+
+  // 测速页：每个节点一行，页面里的脚本逐个请求 /speedtest/run?host=…，把结果填进表格。
+  // 每次 run 都是一次独立的脚本运行，不会撞上设置页脚本的 10 秒时限。
+  function renderSpeedtest(settings, lastMedia) {
+    const original = lastMedia ? core.parseUrl(lastMedia.url) : null;
+    const hosts = [];
+    if (original) hosts.push(original.host);
+    core.MAINLAND_HOSTS.concat(core.OVERSEAS_HOSTS, settings.customHosts).forEach(function (host) { if (hosts.indexOf(host) < 0) hosts.push(host); });
+    const rows = hosts.map(function (host) {
+      const label = original && host === original.host ? "<br><small>App 原本用的节点（基线）</small>" : core.MAINLAND_HOSTS.indexOf(host) >= 0 ? "<br><small>大陆</small>" : core.OVERSEAS_HOSTS.indexOf(host) >= 0 ? "<br><small>海外</small>" : "<br><small>自定义</small>";
+      return "<tr data-host=\"" + escapeHtml(host) + "\"><td class=host>" + escapeHtml(host) + label + "</td><td class=num data-cell=ms>-</td><td class=num data-cell=speed>-</td><td data-cell=note>等待</td></tr>";
+    }).join("");
+    const body = !original
+      ? "<div class=warn>还没有可用的视频地址。先在 B 站 App 里播放一个视频，再回到这里。地址两小时内有效。</div>"
+      : "<div class=sub>用最近一次视频的地址，向每个节点单连接下载 256 KiB，逐个进行，约需一两分钟。第一行是 App 原本用的节点，其余是脚本会换到的节点。测速也会更新“节点记忆”里的速度。</div>"
+        + "<table><tr><th>节点</th><th>耗时</th><th>速度</th><th>结果</th></tr>" + rows + "</table>"
+        + "<button id=again type=button style=\"margin-top:12px\">再测一次</button>"
+        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
+        + "function run(i){if(i>=rows.length){btn.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
+        + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes=262144',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.ok?fmt(d.bps):'-';row.querySelector('[data-cell=note]').textContent=d.ok?'正常':(d.error||'失败');}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
+        + "btn.addEventListener('click',function(){btn.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});btn.disabled=true;run(0);})();</script>";
+    return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>节点测速</title>"
+      + "<style>body{margin:0;padding:16px;font:15px/1.5 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}h1{font-size:20px;margin:0 0 8px}.sub{color:#61666d;font-size:13px;margin-bottom:12px}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:12px}th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500}td.num{text-align:right;white-space:nowrap}td.host{word-break:break-all}small{color:#9499a0}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:10px;background:#fb7299;color:#fff}button:disabled{opacity:.5}a{color:#fb7299}</style></head><body>"
+      + "<h1>节点测速</h1><div class=sub><a href=\"/\">← 返回设置</a></div>" + body + "</body></html>";
+  }
+
+  async function runSpeedtest(query) {
+    const lastMedia = loadLastMedia();
+    const host = core.normalizeCdnHost(query.host);
+    if (!lastMedia) return jsonResponse({ ok: false, error: "还没有可用的视频地址，先播放一个视频" });
+    if (!host) return jsonResponse({ ok: false, error: "节点名不合法" });
+    const bytes = Math.max(64 * 1024, Math.min(2 * 1024 * 1024, Math.trunc(Number(query.bytes)) || 256 * 1024));
+    const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1" };
+    if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
+    const health = BTR.accelerator.loadHealth();
+    const result = await BTR.accelerator.probeHost(lastMedia.url, host, headers, bytes, 8, health);
+    BTR.accelerator.saveHealth(health);
+    return jsonResponse(result);
   }
 
   function htmlResponse(body, status) {
@@ -309,11 +395,13 @@
     return { status: 200, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }, body: JSON.stringify(value, null, 2) };
   }
 
-  // 返回 { status, headers, body }，交给 $done({ response })。
+  // 返回 { status, headers, body } 或它的 Promise，交给 $done({ response })。
   function handle(parts) {
     const query = parseQuery(parts.query);
     const path = (parts.path || "/").replace(/\/+$/, "") || "/";
     let message = "";
+    if (path === "/speedtest") return htmlResponse(renderSpeedtest(loadSettings(), loadLastMedia()));
+    if (path === "/speedtest/run") return runSpeedtest(query);
     if (path === "/save") {
       const next = settingsFromQuery(query);
       message = saveSettings(next) ? "设置已保存。" : "设置保存失败：这个环境没有可用的 $persistentStore。";
@@ -323,6 +411,7 @@
       if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
       if (what === "env" || what === "all") saveEnvFlags({});
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
+      if (what === "all") { env.store.writeJson(LAST_MEDIA_KEY, {}); env.store.writeJson(INFLIGHT_KEY, {}); }
       message = what ? "已重置：" + what + "。" : "没有指定要重置什么。";
     } else if (path === "/diag.json") {
       return jsonResponse({
@@ -363,10 +452,14 @@
     STATS_KEY,
     REASON_LABELS,
     appendLog,
+    claimInflight,
     emptyStats,
     handle,
     loadEnvFlags,
+    loadLastMedia,
     loadLog,
+    releaseInflight,
+    rememberMedia,
     loadSettings,
     loadStats,
     parseQuery,

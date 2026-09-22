@@ -154,6 +154,70 @@ test("设置页可选自动刷新", async () => {
   assert.ok(!bogus.includes("http-equiv=\"refresh\""), "不在选项里的间隔不生效");
 });
 
+test("节点测速：没有视频地址时提示，有地址时逐个节点测，结果也更新节点记忆", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest, MEDIA_URL } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    let env = createEnv({ server, store });
+    let pageHtml = (await env.run(page("/speedtest"))).value.response.body;
+    assert.ok(pageHtml.includes("还没有可用的视频地址"));
+    // 播放一次后记住了地址（含签名，但不进诊断 JSON）。
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    const remembered = store.json("btr.lastMedia");
+    assert.equal(remembered.url, MEDIA_URL);
+    assert.equal(remembered.userAgent, "Bilibili Freedoooooom/MarkII");
+    const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+    assert.ok(!JSON.stringify(diag).includes("upsig="), "诊断 JSON 不能带签名地址");
+    pageHtml = (await env.run(page("/speedtest"))).value.response.body;
+    assert.ok(pageHtml.includes("upos-hz-mirrorakam.akamaized.net"), "第一行是 App 原本用的节点");
+    assert.ok(pageHtml.includes("data-host=\"upos-sz-mirrorali.bilivideo.com\""));
+    server.requests = [];
+    server.setBehavior("upos-sz-mirrorhw.bilivideo.com", { status: 403 });
+    const ok = JSON.parse((await env.run(page("/speedtest/run?host=upos-sz-mirrorali.bilivideo.com&bytes=262144"))).value.response.body);
+    assert.equal(ok.ok, true);
+    assert.equal(ok.bytes, 262144);
+    assert.ok(ok.bps > 0);
+    assert.equal(server.requests[0].headers["user-agent"], "Bilibili Freedoooooom/MarkII");
+    assert.ok(server.requests[0].path.includes("upsig=deadbeef"), "测速要带原地址的签名");
+    const bad = JSON.parse((await env.run(page("/speedtest/run?host=upos-sz-mirrorhw.bilivideo.com"))).value.response.body);
+    assert.equal(bad.ok, false);
+    assert.match(bad.error, /BadRange/);
+    const invalid = JSON.parse((await env.run(page("/speedtest/run?host=evil.example.com"))).value.response.body);
+    assert.equal(invalid.ok, false);
+    const health = store.json("btr.health");
+    assert.ok(health.hosts["upos-sz-mirrorali.bilivideo.com"].bps > 0);
+    assert.ok(health.hosts["upos-sz-mirrorhw.bilivideo.com"].fails >= 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("同一段还在拆的时候再来一份，只换节点不再拆；拆完后再来则照常拆", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    const env = createEnv({ server, store });
+    // 先人为登记一段“正在拆”。
+    store.setJson("btr.inflight", { ["/upgcxcode/12/34/123456/123456-1-30080.m4s#0-1048575"]: Date.now() });
+    const dup = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    assert.ok(dup.value.url, "重复的那份只换节点");
+    assert.equal(store.json("btr.stats").recent[0].reason, "duplicate");
+    // 过期的登记不算。
+    store.setJson("btr.inflight", { ["/upgcxcode/12/34/123456/123456-1-30080.m4s#0-1048575"]: Date.now() - 60000 });
+    const fresh = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    assert.equal(fresh.value.response.status, 206);
+    assert.deepEqual(store.json("btr.inflight"), {}, "拆完后登记被清掉");
+  } finally {
+    await server.close();
+  }
+});
+
 test("不存在的页面返回 404", async () => {
   const env = createEnv({ server: null });
   const { value } = await env.run(page("/nothing"));

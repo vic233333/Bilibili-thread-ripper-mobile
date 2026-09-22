@@ -200,8 +200,10 @@
         fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
           running -= 1;
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
+          env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + Math.round(result.bytes.byteLength / result.elapsedMs) + "KB/s" + (settled ? "（副本落败）" : ""));
           if (settled) return;
           plan.usage[host] = (plan.usage[host] || 0) + 1;
+          plan.pieceMs.push(result.elapsedMs);
           result.host = host;
           finish(true, result);
         }, function (error) {
@@ -250,6 +252,7 @@
       usage: {},
       attempts: 0,
       hedges: 0,
+      pieceMs: [],
       attemptBudget: pieces.length * 3,
       // 每块最多同时几份副本。脚本环境一次最多约 20 个并发请求，线程多时就不开副本。
       hedgeMax: settings.threads <= 10 ? 2 : 1,
@@ -286,8 +289,27 @@
       usage: plan.usage,
       attempts: plan.attempts,
       hedges: plan.hedges,
+      pieceMsMin: plan.pieceMs.length ? Math.min.apply(null, plan.pieceMs) : 0,
+      pieceMsMax: plan.pieceMs.length ? Math.max.apply(null, plan.pieceMs) : 0,
       elapsedMs: Math.max(1, Date.now() - startedAt)
     };
+  }
+
+  // 节点测速：用一个真实的签名地址，向指定节点单连接下一段，返回速度。设置页的测速表用它。
+  async function probeHost(mediaUrl, host, headers, bytes, timeoutSec, health) {
+    const parts = core.parseUrl(mediaUrl);
+    if (!parts) throw env.makeError("BadUrl", "没有可用的视频地址");
+    const url = core.buildUrl(parts, { host, port: "" });
+    const piece = { index: 0, start: 0, end: Math.max(1, bytes) - 1, length: Math.max(1, bytes) };
+    const startedAt = Date.now();
+    try {
+      const result = await fetchPiece(url, piece, headers, timeoutSec);
+      if (health) markSuccess(health, host, result.bytes.byteLength, result.elapsedMs);
+      return { host, ok: true, bytes: result.bytes.byteLength, elapsedMs: result.elapsedMs, bps: Math.round(result.bytes.byteLength * 1000 / result.elapsedMs) };
+    } catch (error) {
+      if (health && error && HOST_ERRORS.indexOf(error.name) >= 0) markFailure(health, host, error);
+      return { host, ok: false, elapsedMs: Date.now() - startedAt, error: env.safeString(error).slice(0, 120) };
+    }
   }
 
   BTR.accelerator = Object.freeze({
@@ -298,6 +320,7 @@
     markFailure,
     markSuccess,
     orderCandidates,
+    probeHost,
     saveHealth
   });
 })(BTR);

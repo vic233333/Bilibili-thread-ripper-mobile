@@ -1,6 +1,6 @@
 {
   "name": "bilibili-thread-ripper-mobile",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Bilibili 线程撕裂者的 iOS 移植：跑在 Shadowrocket 里的多线程分片下载脚本，给 B 站官方 App 加速。",
   "license": "MIT",
