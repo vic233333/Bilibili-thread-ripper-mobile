@@ -62,6 +62,18 @@ Shadowrocket 总是带着一个配置运行，但不必是任何订阅：它内�
 
 更新：Shadowrocket 不会自动更新模块。配置 → 模块 → 左滑对应模块 → 更新。脚本文件由模块里的地址指向本仓库 `main` 分支，模块更新后脚本也会重新拉取。
 
+### 可选：也处理 https 的分片
+
+默认模块只匹配明文 `http://` 的分片，因为目前观察到 App 就是这样下载的，而且这样不需要证书。如果你在 Shadowrocket 的「数据」里看到 B 站的分片请求是 `https://`（或者「最近请求」一直为空、而数据页里有 `upos-` 开头的 https 请求），换用带 HTTPS 的模块变体：
+
+```text
+https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper-https.sgmodule
+```
+
+它与默认模块的区别只有两点：脚本匹配 `https?://`；多了一个 `[MITM]` 段，只解密 `*.bilivideo.com`、`*.bilivideo.cn`、`*.bilivideo.net`、`*.akamaized.net` 这几个视频 CDN 域名，B 站的接口域名不在其中。使用前要在 Shadowrocket 里：配置 → HTTPS 解密 → 开启，生成证书 → 安装证书 → 到系统 设置 → 通用 → 关于本机 → 证书信任设置 里完全信任它。两个模块不要同时启用。
+
+代价和风险：每个分片多一次解密再加密，CPU 和电量开销高一些；如果 B 站 App 对视频 CDN 域名做了证书固定，解密后它会拒绝连接，表现为开了 HTTPS 解密后视频完全放不出来，那就只能用默认模块。脚本自己发出的子请求与此无关，它们本来就可以选 https（见设置页「子请求协议」）。
+
 ## 设置页
 
 在 Safari 打开 `http://btr.settings/`（这不是真实域名，模块里把它指到了本机，请求在发出前就被脚本接住）。
@@ -105,7 +117,7 @@ Shadowrocket 总是带着一个配置运行，但不必是任何订阅：它内�
 
 **设置页打不开**。确认模块已启用且 Shadowrocket 已连接；模块里有一条 `[Host] btr.settings = 127.0.0.1`，如果你的配置改过 DNS 策略导致这条不生效，可以在配置的 `[Host]` 段手动加上同一行。
 
-**「最近请求」一直是空的**。说明脚本没有匹配到 App 的分片请求。依次检查：B 站 App 的流量是否经过 Shadowrocket（在 Shadowrocket 的「数据」里能否看到 `upos-` 开头的请求）；那些请求是 `http://` 还是 `https://`（脚本只匹配明文）；路径是否是 `/upgcxcode/`。把 Shadowrocket 「数据」里的请求截图发到 Issue。
+**「最近请求」一直是空的**。说明脚本没有匹配到 App 的分片请求。依次检查：B 站 App 的流量是否经过 Shadowrocket（在 Shadowrocket 的「数据」里能否看到 `upos-` 开头的请求）；那些请求是 `http://` 还是 `https://`（默认模块只匹配明文，https 要换[带 HTTPS 的模块变体](#可选也处理-https-的分片)）；路径是否是 `/upgcxcode/`。把 Shadowrocket 「数据」里的请求截图发到 Issue。
 
 **结果全是「只换节点」，原因是「环境不支持二进制响应」**。脚本试过一次下载，发现 `$httpClient` 把二进制当文本返回，于是退化为只换节点，并弹了一次通知。这是 Shadowrocket 脚本引擎的行为，请到 Issue 反馈你的 Shadowrocket 版本；升级后可以在设置页点「重新检测环境」再试。
 
@@ -131,7 +143,7 @@ src/            脚本源码，按 core → env → accelerator → settings →
   settings.js     设置页、统计、持久化
   main.js         入口：判断拆分、只换节点或放过，保证一定调 $done
 scripts/build.js  把 src/ 拼成 shadowrocket/bilibili-thread-ripper.js
-shadowrocket/     模块文件和生成的脚本，模块里的地址指向本仓库 main 分支
+shadowrocket/     模块文件（默认 http 版、含 HTTPS 解密版）和生成的脚本，模块里的地址指向本仓库 main 分支
 test/             本地测试：假 CDN（支持 Range、按节点注入故障）、假脚本环境、node:test 用例
 upstream/         上游原始文件的副本，只作对照
 ```

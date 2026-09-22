@@ -149,6 +149,21 @@ test("自定义模式只用填写的节点，不合法的主机名会被丢掉",
   assert.deepEqual([...hosts].sort(), ["upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorcos.bilivideo.com"]);
 });
 
+test("经 MITM 解密后的 https 分片同样被拆分，子请求默认沿用 https", async () => {
+  const url = "https://upos-hz-mirrorakam.akamaized.net" + require("./harness").MEDIA_URL.slice("http://upos-hz-mirrorakam.akamaized.net".length);
+  const store = createStore();
+  store.setJson("btr.settings", { threads: 4 });
+  const env = createEnv({ server, store });
+  const { value } = await env.run(mediaRequest({ url }));
+  assert.equal(value.response.status, 206);
+  assert.ok(Buffer.from(value.response.body).equals(expected(1048576, 3145727)));
+  assert.equal(env.clientCalls.length, 4);
+  for (const call of env.clientCalls) assert.ok(call.url.startsWith("https://upos-sz-"), call.url);
+  // 不拆分时的改写也保留 https。
+  const rewritten = await env.run(mediaRequest({ url, noRange: true }));
+  assert.ok(rewritten.value.url.startsWith("https://upos-sz-"), rewritten.value.url);
+});
+
 test("子请求可以强制走 https（这里只检查地址协议，本地服务器按 http 收）", async () => {
   const store = createStore();
   store.setJson("btr.settings", { subrequestScheme: "https", threads: 2 });
