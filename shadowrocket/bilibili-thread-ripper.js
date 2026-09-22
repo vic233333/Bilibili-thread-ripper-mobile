@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.3.0
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.4.0
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.3.0" };
+const BTR = { VERSION: "0.4.0" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -178,7 +178,8 @@ const BTR = { VERSION: "0.3.0" };
       // 在这一次请求里多给一些，让往返次数成倍减少。播放器认不认得看真机。0 表示关闭。
       overfetchMiB: OVERFETCH_OPTIONS.indexOf(Math.trunc(Number(source.overfetchMiB))) >= 0 ? Math.trunc(Number(source.overfetchMiB)) : 0,
       attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 6)),
-      deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 20)),
+      // 20 秒太长：App 等不到三秒就自己重发，这边却还占着全局在途的名额。
+      deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 10)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
       get minChunkBytes() { return this.minChunkKiB * 1024; },
@@ -615,30 +616,39 @@ const BTR = { VERSION: "0.3.0" };
     };
   }
 
-  // 每块先发给哪个节点。块是等长的，一段什么时候拼完由最慢的那块决定，所以不按速度分份额，
-  // 而是只用速度接近最快节点（不低于它六成）的那几个，块在它们之间轮流分。真机上单个节点
-  // 开八路每路速度几乎不变，所以把所有块都压给最快的一两个节点是合算的。
-  // 有测速数据（不论新鲜与否）的节点按速度排；一个字节都没测过的节点每段最多拿一块去试。
-  // 有速度数据的不到两个时还在热身，轮着撒。
-  const USABLE_RATIO = 0.6;
+  // 一段只用一个节点。真机日志（2026-09-22，麦迪逊 iPad）分得很开：所有块都落在同一个
+  // 节点上的分段，1 MiB 花 70~1125 毫秒；块被撒到三个以上节点的分段，无一例外在 1.4~9.6 秒。
+  // 道理也清楚——一段什么时候拼完由最慢的那块决定，多带一个慢节点就是把整段拖到它的速度，
+  // 而一个快节点自己开五六路几乎不掉速。所以所有块都给当前最快的节点，别的节点只在某块
+  // 卡住时接副本。代价是不再顺手测别的节点，于是每隔一段时间留一块去试，并且给这块更短的
+  // 副本等待时间，让它最多只能拖慢半秒。
+  const TRIAL_INTERVAL_MS = 45 * 1000;
+
+  function fastestFirst(pool, health) {
+    return pool.map(function (host) { return { host, bps: (health.hosts[host] && health.hosts[host].bps) || 0 }; })
+      .sort(function (a, b) { return b.bps - a.bps; });
+  }
+
   function assignPieces(pool, health, count) {
-    const entries = pool.map(function (host) { return { host, record: health.hosts[host] || null }; });
-    const known = entries.filter(function (entry) { return entry.record && entry.record.bps > 0; })
-      .sort(function (a, b) { return b.record.bps - a.record.bps; });
-    const unknown = entries.filter(function (entry) { return !(entry.record && entry.record.bps > 0); });
     const assignment = [];
-    if (known.length < 2 || !pool.length) {
+    if (!pool.length) return assignment;
+    const ranked = fastestFirst(pool, health);
+    const known = ranked.filter(function (entry) { return entry.bps > 0; });
+    // 热身：一个测过速度的节点都没有，撒一轮把它们都量一遍。
+    if (!known.length) {
       for (let index = 0; index < count; index += 1) assignment.push(pool[index % pool.length]);
       return assignment;
     }
-    const best = known[0].record.bps;
-    let usable = known.filter(function (entry) { return entry.record.bps >= best * USABLE_RATIO; });
-    if (!usable.length) usable = known.slice(0, 1);
-    const trials = unknown.length && count >= 4 ? 1 : 0;
-    const shares = count - trials;
-    for (let index = 0; index < shares; index += 1) assignment.push(usable[index % usable.length].host);
-    if (trials) assignment.push(unknown[0].host);
-    return assignment.slice(0, count);
+    const leader = known[0].host;
+    for (let index = 0; index < count; index += 1) assignment.push(leader);
+    // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
+    const now = Date.now();
+    const untried = ranked.filter(function (entry) { return entry.bps <= 0; });
+    if (untried.length && count >= 4 && now - (Number(health.trialAt) || 0) > TRIAL_INTERVAL_MS) {
+      health.trialAt = now;
+      assignment[count - 1] = untried[0].host;
+    }
+    return assignment;
   }
 
   async function fetchPiece(url, piece, headers, timeoutSec) {
@@ -666,12 +676,6 @@ const BTR = { VERSION: "0.3.0" };
     };
   }
 
-  function rotate(list, offset) {
-    if (!list.length) return [];
-    const shift = offset % list.length;
-    return list.slice(shift).concat(list.slice(0, shift));
-  }
-
   // 一块该多久传完：按已测到的最快节点估，超过它的 1.5 倍还没回来就再向另一个节点要一份
   // 副本，先到先用。上游叫这个 hedge。没有测速数据时用固定值。
   function hedgeDelayMs(plan, piece) {
@@ -681,8 +685,11 @@ const BTR = { VERSION: "0.3.0" };
       const record = plan.health.hosts[host];
       if (isMeasured(record, now) && record.bps > best) best = record.bps;
     });
-    if (!best) return 1200;
-    return Math.max(400, Math.min(2500, Math.round(piece.length / best * 1000 * 1.5)));
+    if (!best) return piece.trial ? 600 : 1200;
+    const estimate = Math.round(piece.length / best * 1000 * 1.5);
+    // 试探用的那块：最多让它拖半秒，之后就让最快的节点也下一份。
+    if (piece.trial) return Math.max(300, Math.min(700, estimate));
+    return Math.max(400, Math.min(2500, estimate));
   }
 
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
@@ -690,7 +697,10 @@ const BTR = { VERSION: "0.3.0" };
   function downloadPiece(piece, plan) {
     // 第一选择是按速度分到的节点，之后按速度顺序换别的节点；退避中的排最后。
     const first = plan.assignment[piece.index] || plan.pool[piece.index % plan.pool.length];
-    const order = [first].concat(rotate(plan.pool, piece.index).filter(function (host) { return host !== first; }));
+    // 这块卡住或失败时换谁：按速度从快到慢，而不是轮着来——副本的意义就是尽快拿到这一块。
+    const order = [first].concat(fastestFirst(plan.pool, plan.health)
+      .map(function (entry) { return entry.host; })
+      .filter(function (host) { return host !== first; }));
     plan.all.forEach(function (host) { if (order.indexOf(host) < 0) order.push(host); });
     const queue = [];
     for (let round = 0; round < RETRY_ROUNDS; round += 1) order.forEach(function (host) { queue.push({ host, round }); });
@@ -816,6 +826,10 @@ const BTR = { VERSION: "0.3.0" };
       maxInflight: Math.max(pieces.length, Math.trunc(Number(context.maxInflight)) || 16),
       aborted: false
     };
+    // 分到的节点和领跑的不一样，那块就是去试探的：副本等得更短，不让它拖慢整段。
+    pieces.forEach(function (piece, index) {
+      piece.trial = Boolean(plan.assignment[index] && plan.assignment[index] !== plan.assignment[0]);
+    });
     const tally = {};
     plan.assignment.forEach(function (host) { tally[host.split(".")[0]] = (tally[host.split(".")[0]] || 0) + 1; });
     env.log("debug", "拆成 " + pieces.length + " 块，分配", tally);
@@ -959,7 +973,7 @@ const BTR = { VERSION: "0.3.0" };
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 3;
+  const SETTINGS_REVISION = 4;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -968,6 +982,8 @@ const BTR = { VERSION: "0.3.0" };
     if (revision < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
     // 第 3 版：默认 CDN 模式从大陆改成自动。之前保存的“大陆”是当时的默认值。
     if (revision < 3 && raw.mode === "mainland") delete raw.mode;
+    // 第 4 版：单个分片的总时限从 20 秒改成 10 秒。
+    if (revision < 4 && Number(raw.deadlineSec) === 20) delete raw.deadlineSec;
     return core.normalizeSettings(raw);
   }
 

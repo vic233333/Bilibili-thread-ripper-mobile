@@ -48,7 +48,7 @@
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 3;
+  const SETTINGS_REVISION = 4;
 
   function loadSettings() {
     const raw = loadRawSettings();
@@ -57,6 +57,8 @@
     if (revision < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
     // 第 3 版：默认 CDN 模式从大陆改成自动。之前保存的“大陆”是当时的默认值。
     if (revision < 3 && raw.mode === "mainland") delete raw.mode;
+    // 第 4 版：单个分片的总时限从 20 秒改成 10 秒。
+    if (revision < 4 && Number(raw.deadlineSec) === 20) delete raw.deadlineSec;
     return core.normalizeSettings(raw);
   }
 

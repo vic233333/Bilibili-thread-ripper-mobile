@@ -32,7 +32,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
   assert.equal(value.response.headers.Location, "http://btr.settings/?done=saved");
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
-    revision: 3,
+    revision: 4,
     enabled: true,
     accelerate: "split",
     mode: "custom",
@@ -118,7 +118,7 @@ test("全部重置把设置也恢复成默认值", async () => {
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=all"));
   assert.equal(value.response.status, 302);
-  assert.deepEqual(store.json("btr.settings"), { revision: 3 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 4 });
   assert.deepEqual(store.json("btr.busy"), {});
   assert.deepEqual(store.json("btr.lastMedia"), {});
   const diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
@@ -137,7 +137,7 @@ test("恢复默认设置只动设置，统计和节点记忆留着", async () =>
   const { value } = await env.run(page("/reset?what=settings"));
   assert.equal(value.response.status, 302);
   assert.ok((await env.run(page("/?done=reset&what=settings"))).value.response.body.includes("恢复默认"));
-  assert.deepEqual(store.json("btr.settings"), { revision: 3 });
+  assert.deepEqual(store.json("btr.settings"), { revision: 4 });
   assert.equal(store.json("btr.stats").seen, 9);
   assert.ok(store.json("btr.health").hosts["upos-sz-mirrorali.bilivideo.com"]);
 });
@@ -562,29 +562,35 @@ test("节点排序：热身时撒到所有节点，测过速度后按快慢并�
   assert.deepEqual(allBlocked.pool, ["b.bilivideo.com", "a.bilivideo.com"], "全在退避时先试最早解禁的");
 });
 
-test("分块只用接近最快节点的那几个，等分；没测过的每段最多一块去试；热身时轮着撒；过期的速度仍作先验", async () => {
+test("一段只用最快的那个节点；隔一阵子留一块去试没测过的；热身时轮着撒", async () => {
   const BTR = await loadModules();
   const { assignPieces } = BTR.accelerator;
   const now = Date.now();
   const pool = ["fast.bilivideo.com", "near.bilivideo.com", "half.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com"];
-  const health = { hosts: {
+  const hosts = {
     "fast.bilivideo.com": { bps: 320000, measuredAt: now },
     "near.bilivideo.com": { bps: 260000, measuredAt: now },
     "half.bilivideo.com": { bps: 150000, measuredAt: now },
     "crawl.bilivideo.com": { bps: 40000, measuredAt: now }
-  } };
-  const assignment = assignPieces(pool, health, 8);
-  const count = (host) => assignment.filter((item) => item === host).length;
-  assert.equal(assignment.length, 8);
-  assert.equal(count("fast.bilivideo.com"), 4);
-  assert.equal(count("near.bilivideo.com"), 3, "不低于最快六成的节点一起等分");
-  assert.equal(count("half.bilivideo.com"), 0, "不到六成的不拿，等长的块会被它拖尾");
-  assert.equal(count("crawl.bilivideo.com"), 0);
-  assert.equal(count("new.bilivideo.com"), 1, "没测过的拿一块去试");
-  assert.equal(assignPieces(pool, health, 2).filter((item) => item === "new.bilivideo.com").length, 0, "块太少时不试新节点");
+  };
+
+  // 刚试探过：整段都压给最快的那个，连第二快的都不带——一段的用时由最慢的那块决定。
+  const health = { hosts, trialAt: now };
+  assert.deepEqual(assignPieces(pool, health, 4), Array(4).fill("fast.bilivideo.com"));
+
+  // 距上次试探过了一阵：最后一块去试没测过的节点，其余仍然全给最快的。
+  const due = { hosts, trialAt: now - 60000 };
+  const assignment = assignPieces(pool, due, 8);
+  assert.deepEqual(assignment.slice(0, 7), Array(7).fill("fast.bilivideo.com"));
+  assert.equal(assignment[7], "new.bilivideo.com");
+  assert.ok(due.trialAt >= now, "试探的时间要记下来，免得每段都试");
+  assert.deepEqual(assignPieces(pool, { hosts, trialAt: now - 60000 }, 2), Array(2).fill("fast.bilivideo.com"), "块太少时不试新节点");
+
   // 速度数据过期了也照样按它排，只是不算新鲜。
   const stale = { hosts: { "fast.bilivideo.com": { bps: 320000, measuredAt: now - 3600000 }, "near.bilivideo.com": { bps: 100000, measuredAt: now - 3600000 } } };
-  assert.deepEqual(assignPieces(["fast.bilivideo.com", "near.bilivideo.com"], stale, 4), ["fast.bilivideo.com", "fast.bilivideo.com", "fast.bilivideo.com", "fast.bilivideo.com"]);
+  assert.deepEqual(assignPieces(["fast.bilivideo.com", "near.bilivideo.com"], stale, 4), Array(4).fill("fast.bilivideo.com"));
+
+  // 一个都没测过：撒一轮，把它们一次都量出来。
   const warm = assignPieces(pool, { hosts: {} }, 7);
   assert.deepEqual(warm, ["fast.bilivideo.com", "near.bilivideo.com", "half.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com", "fast.bilivideo.com", "near.bilivideo.com"]);
 });
