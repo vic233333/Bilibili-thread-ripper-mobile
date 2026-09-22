@@ -84,7 +84,7 @@ Shadowrocket 总是带着一个配置运行，但不必是任何订阅：它内�
 
 ### 可选：也处理 https 的分片
 
-默认模块只匹配明文 `http://` 的分片，因为目前观察到 App 就是这样下载的，而且这样不需要证书。如果你在 Shadowrocket 的「数据」里看到 B 站的分片请求是 `https://`（或者「最近请求」一直为空、而数据页里有 `upos-` 开头的 https 请求），换用带 HTTPS 的模块变体：
+默认模块只匹配明文 `http://` 的分片，不需要证书。真机抓包（iPad，2026-09）看到的情况是**两种都有**：起播的头几秒 App 用明文 http 向 `upos-hz-mirrorakam.akamaized.net` 和 `upos-sz-mirrorcosov.bilivideo.com` 取分片，之后的连接改走 443 端口的 TLS，并且会先尝试 QUIC（UDP 443）。所以默认模块只能加速明文那一部分；想覆盖全部，用带 HTTPS 的模块变体：
 
 ```text
 https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper-https.sgmodule
@@ -92,7 +92,7 @@ https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/s
 
 用整份配置的话，对应的是 `bilibili-thread-ripper-https.conf`（同一目录，导入方式相同）。
 
-它与默认模块的区别只有两点：脚本匹配 `https?://`；多了一个 `[MITM]` 段，只解密 `*.bilivideo.com`、`*.bilivideo.cn`、`*.bilivideo.net`、`*.akamaized.net` 这几个视频 CDN 域名，B 站的接口域名不在其中。使用前要在 Shadowrocket 里：配置 → HTTPS 解密 → 开启，生成证书 → 安装证书 → 到系统 设置 → 通用 → 关于本机 → 证书信任设置 里完全信任它。两个模块不要同时启用。
+它与默认模块的区别有三点：脚本匹配 `https?://`；多了一个 `[MITM]` 段，只解密 `*.bilivideo.com`、`*.bilivideo.cn`、`*.bilivideo.net`、`*.akamaized.net` 这几个视频 CDN 域名，B 站的接口域名不在其中；多了几条规则拒掉这些域名的 QUIC（UDP 443），QUIC 无法解密，拒掉后 App 会退回 TCP 的 TLS。使用前要在 Shadowrocket 里：配置 → HTTPS 解密 → 开启，生成证书 → 安装证书 → 到系统 设置 → 通用 → 关于本机 → 证书信任设置 里完全信任它。两个模块不要同时启用。
 
 代价和风险：每个分片多一次解密再加密，CPU 和电量开销高一些；如果 B 站 App 对视频 CDN 域名做了证书固定，解密后它会拒绝连接，表现为开了 HTTPS 解密后视频完全放不出来，那就只能用默认模块。脚本自己发出的子请求与此无关，它们本来就可以选 https（见设置页「子请求协议」）。
 
@@ -148,6 +148,8 @@ Shadowrocket 自己的请求记录在 数据 → 代理，先打开「启用日�
 **更新了模块或配置，设置页显示的版本号还是旧的**。脚本文件是按地址缓存的，Shadowrocket 和 GitHub 的 CDN 都会缓存几分钟。从 0.1.1 起脚本地址带版本参数，只要模块或配置文件本身更新到了新版本，脚本就一定是新的。所以先确认模块或配置文件更新成功（打开它看 `script-path` 里的 `?v=`），刚推送的版本等五分钟再更新一次；还不行就删掉模块重新添加，或者断开再连接一次 Shadowrocket。
 
 **设置页打不开**。确认模块（或整份配置）已启用且 Shadowrocket 已连接。`btr.settings` 不是真实域名，模块和配置里都有一条 `[Host] btr.settings = 185.199.108.153` 把它指到一个会进入隧道的占位地址，请求在发出前就被脚本接住；如果你自己的配置改过 DNS 策略导致这条不生效，在配置的 `[Host]` 段手动加上同一行。看到 GitHub 的 404 页说明域名解析对了但脚本没有接到请求，检查脚本是否下载成功（配置 → 模块 → 点模块看脚本状态）。
+
+**「最近请求」一直是空的，但 数据 → 代理 里明明有 http 的 `upos-` 请求，且策略写的是 `FINAL,DIRECT` 而不是 `HTTP-REQUEST,…`**。这正是 0.1.1 之前真机上出现的情况：两条脚本规则用了同一个脚本地址，只有设置页那条生效。0.1.2 起两条规则的地址不同（`?role=media` 与 `?role=settings`），匹配规则也改成了最简单的写法。更新到 0.1.2 以上即可。
 
 **「最近请求」一直是空的**。说明脚本没有匹配到 App 的任何 CDN 请求（脚本会看到所有 B 站视频 CDN 主机的明文请求，哪怕不能拆分也会记一笔）。依次检查：B 站 App 的流量是否经过 Shadowrocket（数据 → 代理 → 先打开「启用日志记录」，再播放视频，看有没有 `upos-`、`mcdn`、`bilivideo` 的请求）；那些请求是 `http://` 还是 `https://`（默认模块只匹配明文，https 要换[带 HTTPS 的模块变体](#可选也处理-https-的分片)）；端口是不是 80（非标准端口上的明文 HTTP，Shadowrocket 可能不按 HTTP 处理）。导出日志前一定先打开「启用日志记录」，否则导出的 `.db` 文件是空的。把 数据 → 代理 里的请求截图或导出文件发到 Issue。
 

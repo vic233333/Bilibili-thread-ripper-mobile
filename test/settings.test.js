@@ -227,12 +227,18 @@ test("模块和配置文件里的脚本地址都带当前版本号，匹配规�
     const scriptLines = text.split("\n").filter((line) => /^btr-(media|settings) = /.test(line));
     assert.equal(scriptLines.length, 2, file);
     for (const line of scriptLines) {
-      assert.ok(line.includes(`bilibili-thread-ripper.js?v=${pkg.version}`), `${file}: ${line}`);
+      const role = line.startsWith("btr-media") ? "media" : "settings";
+      assert.ok(line.includes(`bilibili-thread-ripper.js?role=${role}&v=${pkg.version}`), `${file}: ${line}`);
       assert.ok(line.includes("engine=webview"), file);
+      // 真机上发现同一个脚本地址的两条规则只有一条生效，所以两条的地址必须不同。
+      assert.ok(!scriptLines.some((other) => other !== line && /script-path=(\S+)/.exec(other)[1] === /script-path=(\S+)/.exec(line)[1]), file);
     }
     const media = scriptLines.find((line) => line.startsWith("btr-media"));
-    const pattern = new RegExp(/pattern=(\S+),/.exec(media)[1]);
+    const patternText = /pattern=(\S+),/.exec(media)[1];
+    assert.ok(!patternText.includes("(?:") && !patternText.endsWith("$"), "匹配规则保持最简单的写法：" + patternText);
+    const pattern = new RegExp(patternText);
     assert.ok(pattern.test("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3/3-1-30080.m4s?x=1"), file);
+    assert.ok(pattern.test("http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/34/75/41969257534/41969257534-1-30216.m4s?e=1&upsig=2"), file);
     assert.ok(pattern.test("http://xy1x2x3x4xy.mcdn.bilivideo.cn:8000/v1/resource/3-1-30080.m4s?x=1"), file);
     assert.ok(!pattern.test("http://api.bilibili.com/x/player/playurl"), file);
     assert.ok(!pattern.test("http://btr.settings/"), file);
