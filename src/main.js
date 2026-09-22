@@ -17,6 +17,10 @@
     return { result: "passthrough", reason, done: {} };
   }
 
+  function startedAtOf(entry) {
+    return entry && entry.at ? entry.at : Date.now();
+  }
+
   // 子请求带上 App 原本的请求头（User-Agent 尤其重要，CDN 会拒绝桌面 UA 的 App 地址）。
   function forwardHeaders(headers) {
     const output = {};
@@ -69,8 +73,19 @@
     if (range.length < settings.minSplitBytes) return single("tooSmall");
     const inflightKey = parts.path + "#" + range.start + "-" + range.end;
     if (settingsModule.claimInflight(inflightKey)) return single("duplicate");
+    // 全局在途上限：别的段还在拆时，这段能开的连接就少一些；一条都开不了就只换节点。
+    const runId = String(startedAtOf(entry)) + Math.random().toString(36).slice(2, 7);
+    const wantedPieces = Math.min(settings.threads, Math.max(1, Math.ceil(range.length / settings.minChunkBytes)));
+    const reserved = settingsModule.reserveBusy(runId, wantedPieces + 2);
+    if (reserved.granted < 2) {
+      settingsModule.releaseInflight(inflightKey);
+      entry.busy = reserved.used;
+      return single("busy");
+    }
+    const runSettings = Object.create(settings, { threads: { value: Math.max(2, Math.min(settings.threads, reserved.granted - 1)) } });
     try {
-      const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings, health });
+      const download = await accelerator.downloadRange({ parts, range, headers: forwardHeaders(headers), settings: runSettings, health, maxInflight: reserved.granted });
+      settingsModule.releaseBusy(runId);
       settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.threads = download.pieces;
@@ -89,6 +104,7 @@
       };
       return { result: "accelerated", reason: "ok", done: { response: { status: 206, headers: responseHeaders, body: download.bytes } } };
     } catch (error) {
+      settingsModule.releaseBusy(runId);
       settingsModule.releaseInflight(inflightKey);
       accelerator.saveHealth(health);
       entry.error = env.safeString(error).slice(0, 120);

@@ -56,7 +56,7 @@ test("越界的值会被拉回范围，缺失的复选框当作关闭", async ()
   const saved = env.store.json("btr.settings");
   assert.equal(saved.enabled, false);
   assert.equal(saved.mode, "auto");
-  assert.equal(saved.threads, 8);
+  assert.equal(saved.threads, 6);
   assert.equal(saved.maxMiB, 24);
   assert.equal(saved.minChunkKiB, 64);
   assert.equal(saved.attemptTimeoutSec, 3);
@@ -112,7 +112,7 @@ test("诊断 JSON 包含版本、能力、设置和统计", async () => {
   assert.equal(diag.version, pkg.version);
   assert.equal(diag.capabilities.httpClient, true);
   assert.equal(diag.capabilities.persistentStore, true);
-  assert.equal(diag.settings.threads, 8);
+  assert.equal(diag.settings.threads, 6);
   assert.equal(diag.settings.maxBytes, 8 * 1024 * 1024);
 });
 
@@ -314,6 +314,58 @@ test("模块和配置文件的脚本行都声明了模式", () => {
     const mode = file.includes("https") ? "https" : "http";
     const lines = text.split("\n").filter((line) => /^btr-(media|settings) = /.test(line));
     for (const line of lines) assert.ok(line.includes(`argument=mode=${mode},`), `${file}: ${line}`);
+  }
+});
+
+test("全局在途上限：别的段占着名额时这段少开几条，占满时只换节点；登记会过期", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest } = require("./harness");
+  const server = new RangeServer({ size: 4 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8 });
+    // 别的运行占了 10 条：这段最多只能开 4 条，减去副本余量后拆 3 块。
+    store.setJson("btr.busy", { other: { n: 10, at: Date.now() } });
+    let env = createEnv({ server, store });
+    let result = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    assert.equal(result.value.response.status, 206);
+    assert.ok(/pieces=3;/.test(result.value.response.headers["X-BTR"]), result.value.response.headers["X-BTR"]);
+    assert.deepEqual(Object.keys(store.json("btr.busy")), ["other"], "结束后自己的登记要注销");
+    // 占满了：只换节点。
+    store.setJson("btr.busy", { other: { n: 13, at: Date.now() } });
+    store.setJson("btr.health", { hosts: { "upos-sz-mirrorali.bilivideo.com": { bps: 1, measuredAt: Date.now() } } });
+    result = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    assert.ok(result.value.url, "应当只换节点");
+    assert.equal(store.json("btr.stats").recent[0].reason, "busy");
+    // 过期的登记不算。
+    store.setJson("btr.busy", { other: { n: 13, at: Date.now() - 60000 } });
+    result = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    assert.ok(/pieces=8;/.test(result.value.response.headers["X-BTR"]));
+  } finally {
+    await server.close();
+  }
+});
+
+test("预取实验页：先交付页面，回调之后把结果写进标记", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    const env = createEnv({ server, store });
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    const { value } = await env.run(page("/probe/after-done"));
+    assert.equal(value.response.status, 200);
+    assert.ok(value.response.body.includes("预取实验"));
+    assert.equal(store.json("btr.env").afterDone.state, "pending", "页面交出去时还在等回调");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(store.json("btr.env").afterDone.state, "ok", "Node 里回调当然会到；真机上要看 Shadowrocket");
+    const result = JSON.parse((await env.run(page("/probe/after-done/result"))).value.response.body);
+    assert.equal(result.state, "ok");
+  } finally {
+    await server.close();
   }
 });
 

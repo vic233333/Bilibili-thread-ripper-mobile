@@ -22,7 +22,7 @@ function expected(start, end) {
 
 test("一个 2 MiB 的 bytes=a-b 分片被拆成 8 块，从多个大陆节点拼回正确的字节", async () => {
   const store = createStore();
-  store.setJson("btr.settings", { revision: 3, mode: "mainland" });
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8 });
   const env = createEnv({ server, store });
   const { value } = await env.run(mediaRequest());
   assert.ok(value.response, "应当直接返回响应");
@@ -90,7 +90,9 @@ test("一个节点返回 403 时，这块换别的节点重试，整段仍然成
 test("Content-Range 对不上或长度不符的响应会被拒绝并换节点", async () => {
   server.setBehavior("upos-sz-mirrorhw.bilivideo.com", { wrongRange: true });
   server.setBehavior("upos-sz-mirrorbos.bilivideo.com", { truncate: true });
-  const env = createEnv({ server });
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8 });
+  const env = createEnv({ server, store });
   const { value } = await env.run(mediaRequest());
   assert.equal(value.response.status, 206);
   assert.ok(Buffer.from(value.response.body).equals(expected(1048576, 3145727)));
@@ -102,7 +104,7 @@ test("Content-Range 对不上或长度不符的响应会被拒绝并换节点", 
 test("一个节点挂起不回时，超时后换节点，整段仍成功", async () => {
   server.setBehavior("upos-sz-mirrorcos.bilivideo.com", { hang: true });
   const store = createStore();
-  store.setJson("btr.settings", { revision: 3, mode: "mainland", attemptTimeoutSec: 3, deadlineSec: 15 });
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8, attemptTimeoutSec: 3, deadlineSec: 15 });
   const env = createEnv({ server, store });
   const { value, elapsedMs } = await env.run(mediaRequest());
   assert.equal(value.response.status, 206);
@@ -153,9 +155,9 @@ test("所有节点都失败时，请求原样交回，不改地址也不改头",
   assert.ok(server.requests.length >= 16, `放弃前至少要把每个节点都试过一遍，实际 ${server.requests.length} 次`);
 });
 
-test("真机上 App 的 1 MiB 画面请求默认拆成 8 块，83 KiB 的音轨请求只换节点", async () => {
+test("真机上 App 的 1 MiB 画面请求按线程数拆块，83 KiB 的音轨请求只换节点", async () => {
   const store = createStore();
-  store.setJson("btr.settings", { revision: 3, mode: "mainland" });
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", threads: 8 });
   const env = createEnv({ server, store });
   // 真机日志里的请求是 bytes=22020096-23068671 这种正好 1 MiB 的区间；假文件只有 4 MiB，取同样大小的一段。
   const video = await env.run(mediaRequest({ headers: { Range: "bytes=2097152-3145727" } }));

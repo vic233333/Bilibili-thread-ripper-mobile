@@ -294,10 +294,10 @@
       hedges: 0,
       pieceMs: [],
       attemptBudget: pieces.length * 3,
-      // 每块最多两份副本；整段同时在途最多 16 个请求（脚本环境的上限约 20）。
+      // 每块最多两份副本；整段同时在途的上限由调用方按全局余量给出（脚本环境的上限约 20）。
       hedgeMax: 2,
       inflight: 0,
-      maxInflight: 16,
+      maxInflight: Math.max(pieces.length, Math.trunc(Number(context.maxInflight)) || 16),
       aborted: false
     };
     const tally = {};

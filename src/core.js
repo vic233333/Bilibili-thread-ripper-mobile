@@ -146,7 +146,8 @@
       // 其余三种与浏览器版相同。真机上哪组节点快因网络而异，所以默认交给测速决定。
       mode: ["mainland", "overseas", "custom"].indexOf(source.mode) >= 0 ? source.mode : "auto",
       customHosts,
-      threads: THREAD_OPTIONS.indexOf(threads) >= 0 ? threads : 8,
+      // 真机上画面和音轨会同时在拆，再加上副本，8 块一段很容易把环境约 20 个并发的上限撑满。
+      threads: THREAD_OPTIONS.indexOf(threads) >= 0 ? threads : 6,
       // 一次请求超过这个大小就不拆分了：整段要先在内存里拼好才能交给播放器。
       maxMiB: Math.round(clamp(source.maxMiB, 2, 24, 8)),
       minChunkKiB,

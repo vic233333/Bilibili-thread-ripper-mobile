@@ -163,6 +163,43 @@
     env.store.writeJson(INFLIGHT_KEY, inflight);
   }
 
+  // 全局在途请求数：脚本环境一次最多约 20 个并发，超过就排队，排队会让所有节点一起“超时”。
+  // 每次拆分前登记自己要开多少条，结束后注销；登记二十秒后自动作废，防止崩掉的运行占着名额。
+  const BUSY_KEY = "btr.busy";
+  const BUSY_TTL_MS = 20 * 1000;
+  const GLOBAL_INFLIGHT_LIMIT = 14;
+
+  function loadBusy() {
+    const stored = env.store.readJson(BUSY_KEY, null);
+    const now = Date.now();
+    const output = {};
+    if (stored && typeof stored === "object") {
+      Object.keys(stored).forEach(function (key) {
+        const item = stored[key];
+        if (item && now - (Number(item.at) || 0) < BUSY_TTL_MS) output[key] = item;
+      });
+    }
+    return output;
+  }
+
+  // 返回这次还能开几条连接（可能是 0）。
+  function reserveBusy(runId, wanted) {
+    const busy = loadBusy();
+    const used = Object.keys(busy).reduce(function (sum, key) { return sum + (Number(busy[key].n) || 0); }, 0);
+    const granted = Math.max(0, Math.min(wanted, GLOBAL_INFLIGHT_LIMIT - used));
+    if (granted > 0) {
+      busy[runId] = { n: granted, at: Date.now() };
+      env.store.writeJson(BUSY_KEY, busy);
+    }
+    return { granted, used };
+  }
+
+  function releaseBusy(runId) {
+    const busy = loadBusy();
+    delete busy[runId];
+    env.store.writeJson(BUSY_KEY, busy);
+  }
+
   function loadEnvFlags() {
     const stored = env.store.readJson(ENV_KEY, null);
     return stored && typeof stored === "object" ? stored : {};
@@ -271,6 +308,7 @@
     tooSmall: "区间太小，不值得拆",
     tooLarge: "区间超过上限",
     duplicate: "同一段还在拆，重发的这份不再拆",
+    busy: "同时在途的请求已到上限，这份不拆",
     splitOff: "设置为只换节点",
     binaryUnsupported: "环境不支持二进制响应",
     failed: "多线程下载失败，已交回原连接",
@@ -437,6 +475,7 @@
       + "<a class=\"btn secondary\" href=\"/reset?what=health\">清空节点记忆</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=env\">重新检测环境</a>"
       + "<a class=\"btn secondary\" href=\"/speedtest\">节点测速</a>"
+      + "<a class=\"btn secondary\" href=\"/probe/after-done\">预取实验</a>"
       + "<a class=\"btn secondary\" href=\"/log.txt\">查看日志</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=log\">清空日志</a>"
       + "<a class=\"btn secondary\" href=\"/diag.json\">诊断 JSON</a>"
@@ -495,6 +534,37 @@
     return jsonResponse(result);
   }
 
+  // 先把结果标成“已发出、等待回调”，立刻返回页面；回调若在 $done 之后到达，会把结果改成 ok。
+  // 页面自己隔两秒去读结果。请求用的是最近一次视频地址上的 64 KiB。
+  function probeAfterDone() {
+    const lastMedia = loadLastMedia();
+    if (!lastMedia) return htmlResponse("<!doctype html><meta charset=utf-8><p>还没有可用的视频地址，先播放一个视频。<a href=\"/\">返回</a></p>");
+    const flags = loadEnvFlags();
+    const startedAt = Date.now();
+    flags.afterDone = { state: "pending", startedAt };
+    saveEnvFlags(flags);
+    const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1" };
+    if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
+    const parts = core.parseUrl(lastMedia.url);
+    const hostList = core.candidateHosts(parts.host, loadSettings());
+    const host = hostList.indexOf(parts.host) >= 0 ? parts.host : hostList[0];
+    // 故意不 await：先让 main 把页面交出去。
+    BTR.accelerator.probeHost(lastMedia.url, host, headers, 64 * 1024, 15, null, 1).then(function (result) {
+      const latest = loadEnvFlags();
+      latest.afterDone = { state: result.ok ? "ok" : "failed", startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, host, error: result.error || "" };
+      saveEnvFlags(latest);
+    }, function (error) {
+      const latest = loadEnvFlags();
+      latest.afterDone = { state: "failed", startedAt, finishedAt: Date.now(), host, error: env.safeString(error).slice(0, 120) };
+      saveEnvFlags(latest);
+    });
+    return htmlResponse("<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>预取实验</title>"
+      + "<style>body{margin:0;padding:16px;font:15px/1.6 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}.card{background:#fff;border-radius:12px;padding:14px 16px;margin:12px 0}code{background:#f1f2f3;padding:1px 4px;border-radius:4px}a{color:#fb7299}</style></head><body>"
+      + "<h1 style=\"font-size:20px\">预取实验</h1><div class=card>脚本已经把这个页面交出去了，同时向 <code>" + escapeHtml(host) + "</code> 发了一个 64 KiB 的请求。如果 Shadowrocket 允许脚本在 <code>$done</code> 之后继续跑完请求，下面几秒内会变成“成功”；一直停在“等待”就说明不允许，预取方案走不通。</div>"
+      + "<div class=card id=result>等待回调…</div><div><a href=\"/\">← 返回设置</a></div>"
+      + "<script>(function(){var box=document.getElementById('result');var tries=0;function poll(){fetch('/probe/after-done/result',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){if(d.state==='ok'){box.textContent='成功：$done 之后的请求在 '+d.elapsedMs+' ms 后回来了（节点 '+d.host+'）。预取方案可行。';return;}if(d.state==='failed'){box.textContent='请求回来了但失败：'+(d.error||'')+'。至少说明回调还在跑。';return;}tries++;box.textContent='等待回调… '+tries*2+' 秒';if(tries<15)setTimeout(poll,2000);else box.textContent='30 秒内没有任何回调：Shadowrocket 在 $done 之后就停掉了脚本，预取方案走不通。';}).catch(function(e){box.textContent='读取结果失败：'+e;});}setTimeout(poll,2000);})();</script></body></html>");
+  }
+
   function htmlResponse(body, status) {
     return { status: status || 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }, body };
   }
@@ -510,6 +580,9 @@
     let message = "";
     if (path === "/speedtest") return htmlResponse(renderSpeedtest(loadSettings(), loadLastMedia()));
     if (path === "/speedtest/run") return runSpeedtest(query);
+    // 实验：脚本调完 $done 之后，它发出的请求还会不会跑完。会的话就能在交付这一段之后预取下一段。
+    if (path === "/probe/after-done") return probeAfterDone();
+    if (path === "/probe/after-done/result") return jsonResponse(loadEnvFlags().afterDone || { state: "none" });
     if (path === "/save") {
       const next = settingsFromQuery(query);
       message = saveSettings(next) ? "设置已保存。" : "设置保存失败：这个环境没有可用的 $persistentStore。";
@@ -559,8 +632,12 @@
     SETTINGS_KEY,
     STATS_KEY,
     REASON_LABELS,
+    GLOBAL_INFLIGHT_LIMIT,
     appendLog,
     claimInflight,
+    loadBusy,
+    releaseBusy,
+    reserveBusy,
     emptyStats,
     handle,
     loadEnvFlags,
