@@ -172,6 +172,8 @@
     entry.elapsedMs = Date.now() - startedAt;
     if (outcome.host) entry.rewrittenTo = outcome.host;
     try {
+      // 心跳先写：统计存不下来时，靠它还能看出脚本到底有没有跑过。
+      settingsModule.recordBeat("media");
       // 设置页以外的请求都记一笔；notMedia 的也记，方便在设置页看到脚本到底匹配到了什么。
       const stats = settingsModule.loadStats();
       settingsModule.recordOutcome(stats, entry);

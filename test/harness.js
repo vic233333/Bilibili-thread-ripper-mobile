@@ -39,11 +39,12 @@ function createStore(initial = {}) {
     read(key) { return map.has(key) ? map.get(key) : null; },
     write(value, key) { map.set(key, String(value)); return true; },
     json(key) { return map.has(key) ? JSON.parse(map.get(key)) : null; },
+    remove(key) { map.delete(key); },
     setJson(key, value) { map.set(key, JSON.stringify(value)); }
   };
 }
 
-// options: { server, request, store, binaryMode (default true), honorTimeout (default true), expose }
+// options: { server, request, store, noStore, binaryMode (default true), honorTimeout (default true), expose }
 function createEnv(options) {
   const server = options.server;
   const store = options.store || createStore();
@@ -96,7 +97,8 @@ function createEnv(options) {
     }
   };
 
-  const $persistentStore = { read: (key) => store.read(key), write: (value, key) => store.write(value, key) };
+  // noStore: true 模仿没有持久存储的环境。
+  const $persistentStore = options.noStore ? undefined : { read: (key) => store.read(key), write: (value, key) => store.write(value, key) };
   // 模仿 WebView：setTimeout 只能作为全局函数调用，this 必须是 undefined 或全局对象。
   const strictSetTimeout = function (callback, delayMs) {
     if (this !== undefined && this !== globalThis) throw new TypeError("Can only call Window.setTimeout on instances of Window");

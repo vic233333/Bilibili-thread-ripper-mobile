@@ -21,7 +21,18 @@
   const INFLIGHT_TTL_MS = 12 * 1000;
   const RECENT_LIMIT = 12;
   const LOG_LIMIT = 300;
+  const LOG_LINE_LIMIT = 400;
+  const LOG_BYTES_LIMIT = 48 * 1024;
   const AUTO_REFRESH_OPTIONS = [5, 15, 30];
+
+  // 心跳：每次运行写下的最小记录，用来回答“脚本到底有没有在跑”和“存储到底存不存得住”。
+  // 只有几十字节，统计和节点记忆写不进去的时候它通常还写得进去。
+  const BEAT_KEY = "btr.beat";
+  // 预取实验的结果单独放一把键：它的回调落在 $done 之后，万一环境把晚到的写入当成整份快照回写，
+  // 也只会波及这把键，碰不到设置和统计。
+  const PROBE_KEY = "btr.probe";
+  // 存储自检写的临时键。
+  const PROBE_STORE_KEY = "btr.storetest";
 
   const RESET_LABELS = {
     settings: "设置（恢复默认）",
@@ -85,6 +96,51 @@
     return env.store.writeJson(STATS_KEY, stats);
   }
 
+  function loadBeat() {
+    const stored = env.store.readJson(BEAT_KEY, null);
+    return stored && typeof stored === "object" ? stored : {};
+  }
+
+  // role: "media"（分片请求那次运行）或 "page"（设置页那次运行）。
+  function recordBeat(role) {
+    const beat = loadBeat();
+    const now = Date.now();
+    if (role === "media") {
+      beat.mediaAt = now;
+      beat.mediaN = (Number(beat.mediaN) || 0) + 1;
+    } else {
+      beat.pageAt = now;
+      beat.pageN = (Number(beat.pageN) || 0) + 1;
+    }
+    beat.v = BTR.VERSION;
+    return env.store.writeJson(BEAT_KEY, beat);
+  }
+
+  // 存储自检：分三层问清楚问题出在哪。有没有这个接口；写完能不能马上读回来；
+  // 上一次运行写下的东西这次还在不在。第三项才是“统计一直清零”要看的那一项。
+  const STORE_KEYS = [
+    ["btr.settings", "设置"], ["btr.stats", "统计"], ["btr.health", "节点记忆"], ["btr.log", "日志"],
+    ["btr.env", "环境判断"], ["btr.beat", "心跳"], ["btr.probe", "预取实验"],
+    ["btr.lastMedia", "测速用地址"], ["btr.inflight", "在途登记"], ["btr.busy", "全局在途"]
+  ];
+
+  function storeSelfTest() {
+    const previous = env.store.readJson(PROBE_STORE_KEY, null);
+    const token = String(Date.now()) + "-" + Math.random().toString(36).slice(2, 8);
+    const wrote = env.store.writeJson(PROBE_STORE_KEY, { token, at: Date.now(), version: BTR.VERSION });
+    const readBack = env.store.readJson(PROBE_STORE_KEY, null);
+    return {
+      available: env.capabilities().persistentStore,
+      wrote: Boolean(wrote),
+      sameRun: Boolean(readBack && readBack.token === token),
+      previous: previous && previous.token ? { ageMs: Date.now() - (Number(previous.at) || 0), version: previous.version || "" } : null,
+      keys: STORE_KEYS.map(function (item) {
+        const text = env.store.read(item[0]);
+        return { key: item[0], label: item[1], bytes: text ? text.length : 0 };
+      })
+    };
+  }
+
   // entry: { at, kind, host, range, length, result, reason, elapsedMs, threads, hosts, error }
   function recordOutcome(stats, entry) {
     stats.seen += 1;
@@ -117,8 +173,11 @@
     if (!lines || !lines.length) return false;
     const stamp = formatTime(at || Date.now());
     const log = loadLog();
-    lines.forEach(function (line) { log.push(stamp + " " + line); });
+    lines.forEach(function (line) { log.push((stamp + " " + line).slice(0, LOG_LINE_LIMIT)); });
     if (log.length > LOG_LIMIT) log.splice(0, log.length - LOG_LIMIT);
+    // 再按总字节数收一次：一把键太大时，有的脚本环境会整个写不进去，那会把统计和设置一起拖下水。
+    let size = log.reduce(function (sum, line) { return sum + line.length + 3; }, 0);
+    while (log.length > 1 && size > LOG_BYTES_LIMIT) size -= log.shift().length + 3;
     return env.store.writeJson(LOG_KEY, log);
   }
 
@@ -386,8 +445,14 @@
     const refreshLinks = "<div class=sub>自动刷新：" + (auto ? "<a href=\"/\">关</a>" : "<b>关</b>") + AUTO_REFRESH_OPTIONS.map(function (seconds) {
       return " · " + (auto === seconds ? "<b>" + seconds + " 秒</b>" : "<a href=\"/?auto=" + seconds + "\">" + seconds + " 秒</a>");
     }).join("") + "</div>";
+    const beat = state.beat || {};
+    const mediaRuns = Number(beat.mediaN) || 0;
+    const pageOpens = Number(beat.pageN) || 0;
     const warnings = [];
     if (!capabilities.persistentStore) warnings.push("这个环境没有 $persistentStore，设置和统计都保存不了。");
+    // 心跳记到分片脚本跑过，统计却读不回来：数据没保存下来，不是脚本没跑。
+    else if (!state.statsStored && mediaRuns > 0) warnings.push("分片脚本运行过 " + mediaRuns + " 次，统计却读不回来：持久存储没有把数据保存下来。点下面的「存储自检」看是哪一层断了。");
+    else if (pageOpens <= 1) warnings.push("这是记到的第 " + pageOpens + " 次打开设置页。刷新一下，这个数字应该变成 " + (pageOpens + 1) + "；如果一直不涨，说明存储没有生效，统计当然也会一直是 0。");
     if (!capabilities.httpClient) warnings.push("这个环境没有 $httpClient，脚本无法发起下载。");
     if (!capabilities.timers) warnings.push("这个环境没有 setTimeout，子请求只能依赖环境自身的超时。");
     if (flags.binaryUnsupported) warnings.push("之前检测到脚本环境把二进制响应当成了文本，现在只换节点、不拆分。修好后点下面的“重新检测环境”。");
@@ -428,7 +493,9 @@
       + "<div><small>只换了节点</small><b>" + stats.rewritten + "</b></div>"
       + "<div><small>多线程平均速度</small><b>" + formatSpeed(avgSpeed) + "</b></div>"
       + "<div><small>多线程下载量</small><b>" + formatBytes(stats.bytes) + "</b></div>"
-      + "<div><small>统计开始于</small><b>" + formatTime(stats.since) + "</b></div>"
+      + "<div><small>统计开始于" + (state.statsStored ? "" : "（这次新建的）") + "</small><b>" + formatTime(stats.since) + "</b></div>"
+      + "<div><small>分片脚本运行过</small><b>" + mediaRuns + " 次</b>" + (beat.mediaAt ? "<small>最后一次 " + formatTime(beat.mediaAt) + "</small>" : "<small>还没跑过</small>") + "</div>"
+      + "<div><small>设置页打开过</small><b>" + pageOpens + " 次</b><small>刷新一次应当 +1</small></div>"
       + "</div></div>"
       + "<form class=card method=get action=\"/save\">"
       + "<h2 style=\"margin-top:0\">设置</h2>"
@@ -487,6 +554,7 @@
       + "<a class=\"btn secondary\" href=\"/probe/after-done\">预取实验</a>"
       + "<a class=\"btn secondary\" href=\"/log.txt\">查看日志</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=log\">清空日志</a>"
+      + "<a class=\"btn secondary\" href=\"/store/test\">存储自检</a>"
       + "<a class=\"btn secondary\" href=\"/diag.json\">诊断 JSON</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=settings\">恢复默认设置</a>"
       + "<a class=\"btn secondary\" href=\"/reset?what=all\">全部重置</a>"
@@ -556,13 +624,16 @@
   const PROBE_BYTES = 64 * 1024;
   const PROBE_TIMEOUT_SEC = 40;
 
+  function loadProbe() {
+    const stored = env.store.readJson(PROBE_KEY, null);
+    return stored && typeof stored === "object" ? stored : {};
+  }
+
   function recordProbe(name, value) {
-    const flags = loadEnvFlags();
-    const probe = flags.afterDone && typeof flags.afterDone === "object" ? flags.afterDone : {};
+    const probe = loadProbe();
     probe[name] = value;
     probe.updatedAt = Date.now();
-    flags.afterDone = probe;
-    saveEnvFlags(flags);
+    env.store.writeJson(PROBE_KEY, probe);
   }
 
   // 发一个探针请求。onCallback 记下真正的回调什么时候到，哪怕这边已经按超时判负了。
@@ -596,9 +667,7 @@
     const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1", Range: "bytes=0-" + (PROBE_BYTES - 1) };
     if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
     const startedAt = Date.now();
-    saveEnvFlags(Object.assign(loadEnvFlags(), {
-      afterDone: { version: BTR.VERSION, host: host, startedAt: startedAt, updatedAt: startedAt }
-    }));
+    env.store.writeJson(PROBE_KEY, { version: BTR.VERSION, host: host, startedAt: startedAt, updatedAt: startedAt });
     // 先跑一次普通请求，跑完再交页面：它成功了，后面两项收不到回调才说明问题在环境。
     return probeRequest("control", url, headers, 6).then(function () {
       probeRequest("pending", url, headers, PROBE_TIMEOUT_SEC);
@@ -642,6 +711,35 @@
       + "setTimeout(poll,1500);})();</script></body></html>";
   }
 
+  // 存储自检页：三层结论写在最上面，下面列出每把键当前占多少字节。
+  function renderStoreTest(result, beat) {
+    const rows = result.keys.map(function (item) {
+      return "<tr><th>" + escapeHtml(item.label) + "<br><small style=\"color:#9499a0\">" + escapeHtml(item.key) + "</small></th><td>" + (item.bytes ? item.bytes + " 字节" : "空") + "</td></tr>";
+    }).join("");
+    const verdict = !result.available
+      ? "<b>这个环境没有 $persistentStore。</b>脚本存不下任何东西，统计、设置、节点记忆每次运行都会回到默认值。"
+      : !result.wrote || !result.sameRun
+        ? "<b>写得进、读不回来。</b>同一次运行里刚写下的值就读不出来，存储接口是坏的。"
+        : result.previous
+          ? "<b>存储正常。</b>上一次运行写下的值这次还在，写于 " + Math.round(result.previous.ageMs / 1000) + " 秒前（版本 " + escapeHtml(result.previous.version) + "）。统计还是清零的话，问题不在存储。"
+          : "<b>还差一步。</b>这次写下了一个值，但没看到上一次的。<u>刷新这个页面</u>：再看到这句话就说明跨运行保存失败，那正是统计一直清零的原因。";
+    return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>存储自检</title>"
+      + "<style>body{margin:0;padding:16px;font:15px/1.6 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}.card{background:#fff;border-radius:12px;padding:14px 16px;margin:12px 0}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:6px 4px;border-bottom:1px solid #eee}th{font-weight:500;color:#61666d}td{text-align:right;font-variant-numeric:tabular-nums}a{color:#fb7299}code{background:#f1f2f3;padding:1px 4px;border-radius:4px}</style></head><body>"
+      + "<h1 style=\"font-size:20px\">存储自检</h1>"
+      + "<div class=card>" + verdict + "</div>"
+      + "<div class=card><table>"
+      + "<tr><th>接口存在</th><td>" + (result.available ? "是" : "否") + "</td></tr>"
+      + "<tr><th>写入返回成功</th><td>" + (result.wrote ? "是" : "否") + "</td></tr>"
+      + "<tr><th>同一次运行读回</th><td>" + (result.sameRun ? "是" : "否") + "</td></tr>"
+      + "<tr><th>上一次运行的值还在</th><td>" + (result.previous ? "是" : "否") + "</td></tr>"
+      + "<tr><th>分片脚本运行过</th><td>" + (Number(beat.mediaN) || 0) + " 次</td></tr>"
+      + "<tr><th>设置页打开过</th><td>" + (Number(beat.pageN) || 0) + " 次</td></tr>"
+      + "</table></div>"
+      + "<div class=card><table>" + rows + "</table></div>"
+      + "<div><a href=\"/store/test\">再测一次</a> · <a href=\"/\">← 返回设置</a></div>"
+      + "</body></html>";
+  }
+
   function htmlResponse(body, status) {
     return { status: status || 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }, body };
   }
@@ -654,12 +752,15 @@
   function handle(parts) {
     const query = parseQuery(parts.query);
     const path = (parts.path || "/").replace(/\/+$/, "") || "/";
+    // 每打开一次页面就 +1。刷新之后这个数字不涨，就说明存储根本没在保存。
+    recordBeat("page");
     let message = "";
     if (path === "/speedtest") return htmlResponse(renderSpeedtest(loadSettings(), loadLastMedia()));
     if (path === "/speedtest/run") return runSpeedtest(query);
     // 实验：脚本调完 $done 之后，它发出的请求还会不会跑完。会的话就能在交付这一段之后预取下一段。
     if (path === "/probe/after-done") return probeAfterDone();
-    if (path === "/probe/after-done/result") return jsonResponse(loadEnvFlags().afterDone || { state: "none" });
+    if (path === "/probe/after-done/result") return jsonResponse(loadProbe());
+    if (path === "/store/test") return htmlResponse(renderStoreTest(storeSelfTest(), loadBeat()));
     if (path === "/save") {
       const next = settingsFromQuery(query);
       message = saveSettings(next) ? "设置已保存。" : "设置保存失败：这个环境没有可用的 $persistentStore。";
@@ -669,12 +770,13 @@
       if (what === "settings" || what === "all") env.store.writeJson(SETTINGS_KEY, { revision: SETTINGS_REVISION });
       if (what === "stats" || what === "all") saveStats(emptyStats());
       if (what === "health" || what === "all") BTR.accelerator.saveHealth({ hosts: {} });
-      if (what === "env" || what === "all") saveEnvFlags({});
+      if (what === "env" || what === "all") { saveEnvFlags({}); env.store.writeJson(PROBE_KEY, {}); }
       if (what === "log" || what === "all") env.store.writeJson(LOG_KEY, []);
       if (what === "all") {
         env.store.writeJson(LAST_MEDIA_KEY, {});
         env.store.writeJson(INFLIGHT_KEY, {});
         env.store.writeJson(BUSY_KEY, {});
+        env.store.writeJson(BEAT_KEY, {});
       }
       message = RESET_LABELS[what] ? "已重置：" + RESET_LABELS[what] + "。" : "没有指定要重置什么。";
     } else if (path === "/diag.json") {
@@ -684,6 +786,8 @@
         settings: loadSettings(),
         flags: loadEnvFlags(),
         stats: loadStats(),
+        beat: loadBeat(),
+        probe: loadProbe(),
         health: BTR.accelerator.loadHealth(),
         log: loadLog()
       });
@@ -700,6 +804,8 @@
     return htmlResponse(renderPage({
       settings: loadSettings(),
       stats: loadStats(),
+      statsStored: Boolean(env.store.read(STATS_KEY)),
+      beat: loadBeat(),
       health: BTR.accelerator.loadHealth(),
       flags: loadEnvFlags(),
       capabilities: env.capabilities(),
@@ -718,6 +824,8 @@
     GLOBAL_INFLIGHT_LIMIT,
     appendLog,
     claimInflight,
+    loadBeat,
+    recordBeat,
     loadBusy,
     releaseBusy,
     reserveBusy,

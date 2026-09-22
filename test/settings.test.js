@@ -391,7 +391,7 @@ test("预取实验页：先交付页面，回调之后把结果写进标记", as
     const { value } = await env.run(page("/probe/after-done"));
     assert.equal(value.response.status, 200);
     assert.ok(value.response.body.includes("预取实验"));
-    const atDelivery = store.json("btr.env").afterDone;
+    const atDelivery = store.json("btr.probe");
     assert.equal(atDelivery.control.state, "ok", "对照那一发在交页面之前就该跑完");
     assert.equal(atDelivery.pending.state, "sent", "页面交出去时另一发还在路上");
     await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -403,6 +403,48 @@ test("预取实验页：先交付页面，回调之后把结果写进标记", as
   } finally {
     await server.close();
   }
+});
+
+test("心跳记下脚本跑过几次，统计存不下来时也看得出来", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    const env = createEnv({ server, store });
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    await env.run(mediaRequest({ noRange: true }));
+    assert.equal(store.json("btr.beat").mediaN, 2, "两次分片请求应当记两次心跳");
+    const first = await env.run(page("/"));
+    assert.equal(store.json("btr.beat").pageN, 1);
+    assert.ok(first.value.response.body.includes("分片脚本运行过"));
+    await env.run(page("/"));
+    assert.equal(store.json("btr.beat").pageN, 2, "每打开一次设置页 +1");
+
+    // 存储把统计丢了：页面要说出“脚本跑过、但存不下来”，而不是一味显示 0。
+    store.remove("btr.stats");
+    const again = await env.run(page("/"));
+    assert.match(again.value.response.body, /持久存储没有把数据保存下来/);
+    assert.ok(again.value.response.body.includes("这次新建的"));
+  } finally {
+    await server.close();
+  }
+});
+
+test("存储自检分三层报告：接口、同一次运行读回、跨运行保留", async () => {
+  const store = createStore();
+  const env = createEnv({ server: null, store });
+  const first = await env.run(page("/store/test"));
+  assert.equal(first.value.response.status, 200);
+  assert.match(first.value.response.body, /还差一步/, "第一次没有上一次的值可比");
+  const second = await env.run(page("/store/test"));
+  assert.match(second.value.response.body, /存储正常/, "第二次应当读到上一次写下的值");
+  assert.match(second.value.response.body, /btr\.stats/, "要列出每把键占多少字节");
+
+  const dead = createEnv({ server: null, noStore: true });
+  const broken = await dead.run(page("/store/test"));
+  assert.match(broken.value.response.body, /没有 \$persistentStore/);
 });
 
 test("不存在的页面返回 404", async () => {
