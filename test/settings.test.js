@@ -677,19 +677,59 @@ test("记分跌得快涨得慢，崩掉的节点一两段就让位", async () =>
   markSuccess(health, "fast.bilivideo.com", 1048576, 100);
   assert.ok(health.hosts["fast.bilivideo.com"].bps < low + 10e6 * 0.35);
 
-  // 整段实测：一个节点拿走八成以上的块才算数。
+  // 整段实测记在「押给谁」头上：被副本救回来的慢段不能记成救场那个的成绩。
   const seg = { hosts: {} };
-  assert.equal(markSegment(seg, { "a.bilivideo.com": 3, "b.bilivideo.com": 3 }, 1048576, 1000), "", "两家平分不算谁的成绩");
-  assert.equal(markSegment(seg, { "a.bilivideo.com": 4, "b.bilivideo.com": 2 }, 1048576, 1000), "", "四比二不到八成");
-  assert.equal(markSegment(seg, { "a.bilivideo.com": 5, "b.bilivideo.com": 1 }, 1048576, 100), "a.bilivideo.com", "六块里只有一块借了别家，仍然算这个节点的成绩");
-  assert.equal(markSegment(seg, { "a.bilivideo.com": 6 }, 1048576, 100), "a.bilivideo.com");
+  assert.equal(markSegment(seg, "", 1048576, 1000), "", "没有领跑者就没有成绩");
+  assert.equal(markSegment(seg, "a.bilivideo.com", 1048576, 100), "a.bilivideo.com");
   assert.ok(seg.hosts["a.bilivideo.com"].segBps > 9e6);
   // 同一个节点下一段崩了，整段实测同样跌得快。
-  markSegment(seg, { "a.bilivideo.com": 6 }, 1048576, 5700);
+  markSegment(seg, "a.bilivideo.com", 1048576, 5700);
   assert.ok(seg.hosts["a.bilivideo.com"].segBps < 3.5e6);
   seg.leader = "a.bilivideo.com";
   seg.hosts["b.bilivideo.com"] = { segBps: 9e6, segAt: Date.now() };
   assert.equal(chooseLeader(["a.bilivideo.com", "b.bilivideo.com"], seg, ""), "b.bilivideo.com", "崩了就该换人");
+});
+
+test("悲观采样：开副本那一刻就把「至少用了这么久」记进节点记忆", async () => {
+  const BTR = await loadModules();
+  const { markSlow, markSuccess, markFailure } = BTR.accelerator;
+  const health = { hosts: {} };
+  markSuccess(health, "fast.bilivideo.com", 1048576, 100);
+  const peak = health.hosts["fast.bilivideo.com"].bps;
+
+  // 还没回来的请求：174 KiB 已经等了 2 秒，速度至多 87 KB/s，记一笔。
+  assert.equal(markSlow(health, "fast.bilivideo.com", 174763, 2000), true);
+  assert.ok(health.hosts["fast.bilivideo.com"].bps < peak * 0.35);
+  // 才等了 100 毫秒，判不出慢，不记。
+  const before = health.hosts["fast.bilivideo.com"].bps;
+  assert.equal(markSlow(health, "fast.bilivideo.com", 174763, 100), false);
+  assert.equal(health.hosts["fast.bilivideo.com"].bps, before);
+  // 上界比现有记录还宽松，说明这次还算快，也不记。
+  assert.equal(markSlow(health, "fast.bilivideo.com", 1048576, 300), false);
+
+  // 超时同样要掉分：以前这里只记退避不动分数，卡死的节点熬过退避又回来当领跑者。
+  const stuck = { hosts: {} };
+  markSuccess(stuck, "dead.bilivideo.com", 1048576, 100);
+  const high = stuck.hosts["dead.bilivideo.com"].bps;
+  markFailure(stuck, "dead.bilivideo.com", { name: "TimeoutError" }, 174763, 4000);
+  assert.ok(stuck.hosts["dead.bilivideo.com"].bps < high * 0.35, "超时的节点必须掉分");
+  assert.ok(stuck.hosts["dead.bilivideo.com"].blockedUntil > Date.now());
+});
+
+test("副本等待时间按这块派给的那个节点自己的块耗时来估", async () => {
+  const BTR = await loadModules();
+  const { markSuccess, hedgeDelayMs } = BTR.accelerator;
+  const health = { hosts: {} };
+  markSuccess(health, "quick.bilivideo.com", 174763, 90);
+  markSuccess(health, "slow.bilivideo.com", 174763, 1500);
+  const plan = { health, assignment: ["quick.bilivideo.com", "slow.bilivideo.com"] };
+  const piece = { index: 0, length: 174763 };
+  assert.equal(hedgeDelayMs(plan, piece), 400, "快节点：按它自己的 90 毫秒估，落到 400 毫秒下限");
+  const other = hedgeDelayMs(plan, { index: 1, length: 174763 });
+  assert.ok(other > 2000 && other <= 2500, "慢节点：别急着开副本，它本来就要这么久 " + other);
+  // 试探块单独一档，最多拖半秒多一点。
+  const trial = hedgeDelayMs(plan, { index: 1, length: 174763, trial: true });
+  assert.ok(trial >= 300 && trial <= 700, "试探块 " + trial);
 });
 
 test("构建产物带有原作署名，且与 package.json 版本一致", () => {

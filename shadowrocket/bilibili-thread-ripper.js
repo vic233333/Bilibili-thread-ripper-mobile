@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.5.0
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.6.0
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.5.0" };
+const BTR = { VERSION: "0.6.0" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -516,7 +516,7 @@ const BTR = { VERSION: "0.5.0" };
   const HEALTH_KEY = "btr.health";
   // 测过的速度算“新鲜”的时限：新鲜的节点按速度排进节点池；过了时限的仍保留速度作为先验
   // （分块时照样按它排），只是排队时让位给新鲜的。每块下载都会刷新速度，所以自我修正得很快。
-  const MEASURE_TTL_MS = 10 * 60 * 1000;
+  const MEASURE_TTL_MS = 90 * 1000;
   // 4xx 是节点明确拒绝了这个地址（比如 akamai 对脚本的子请求返回 403），短时间内重试没有意义。
   const REFUSED_BLOCK_MS = 5 * 60 * 1000;
   // 只有传够这么多字节的一块才拿来算速度，尾巴太短的会误判。
@@ -563,6 +563,13 @@ const BTR = { VERSION: "0.5.0" };
     return previous * (1 - weight) + sample * weight;
   }
 
+  // 耗时的极性和速度相反：变慢时跟得紧，变快时慢慢信。
+  function blendMs(previous, sample) {
+    if (!(previous > 0)) return sample;
+    const weight = sample > previous ? FALL : RISE;
+    return previous * (1 - weight) + sample * weight;
+  }
+
   function markSuccess(health, host, bytes, elapsedMs) {
     const record = recordOf(health, host);
     const now = Date.now();
@@ -571,29 +578,39 @@ const BTR = { VERSION: "0.5.0" };
     record.okAt = now;
     if (bytes >= SPEED_SAMPLE_MIN_BYTES && elapsedMs > 0) {
       record.bps = blend(record.bps, bytes * 1000 / elapsedMs);
+      record.pieceMs = blendMs(record.pieceMs, elapsedMs);
       record.measuredAt = now;
     }
   }
 
+  // 悲观采样。这是这个环境里最要命的一处偏差：脚本一调 $done，没回来的请求就再也不会回调，
+  // 所以「慢」这件事本身从来没被记下来过——节点记忆里每一个样本都是「这次赢了」的样本，
+  // 慢节点的分数永远停在它状态好的时候。而在开副本的那一刻，我们已经可以断定「这个节点这一块
+  // 至少用了这么久」，速度至多是 bytes/elapsedMs。这是能在 $done 之前拿到的唯一一次慢样本。
+  const SLOW_SAMPLE_MIN_MS = 250;
+
+  function markSlow(health, host, bytes, elapsedMs) {
+    if (!host || !(bytes > 0) || !(elapsedMs >= SLOW_SAMPLE_MIN_MS)) return false;
+    const record = recordOf(health, host);
+    const bound = bytes * 1000 / elapsedMs;
+    // 上界比现有记录还宽，说明还谈不上慢，不记。
+    if (record.bps > 0 && bound >= record.bps) return false;
+    record.bps = blend(record.bps, bound);
+    record.pieceMs = blendMs(record.pieceMs, elapsedMs);
+    record.measuredAt = Date.now();
+    return true;
+  }
+
   // 整段的实测速度才是“这个节点开五六路能有多快”的可靠证据：单块的测量（试探块、救急的副本）
   // 偏乐观，块小、连接新，读出来的速度撑不起整段。只有某个节点拿走了一段里绝大多数块时才记。
-  const SEGMENT_SHARE = 0.8;
-  const SEGMENT_TTL_MS = 5 * 60 * 1000;
+  const SEGMENT_TTL_MS = 2 * 60 * 1000;
 
-  function markSegment(health, usage, bytes, elapsedMs) {
-    const hosts = Object.keys(usage || {});
-    if (!hosts.length || !(bytes > 0) || !(elapsedMs > 0)) return "";
-    let total = 0;
-    let lead = hosts[0];
-    hosts.forEach(function (host) {
-      total += usage[host];
-      if (usage[host] > usage[lead]) lead = host;
-    });
-    if (!total || usage[lead] / total < SEGMENT_SHARE) return "";
-    const record = recordOf(health, lead);
+  function markSegment(health, leader, bytes, elapsedMs) {
+    if (!leader || !(bytes > 0) || !(elapsedMs > 0)) return "";
+    const record = recordOf(health, leader);
     record.segBps = blend(record.segBps, bytes * 1000 / elapsedMs);
     record.segAt = Date.now();
-    return lead;
+    return leader;
   }
 
   // 领跑者的分数。有整段实测就用整段的；只有单块测量的打对折，因为它偏乐观。
@@ -637,9 +654,12 @@ const BTR = { VERSION: "0.5.0" };
     return incumbent;
   }
 
-  function markFailure(health, host, error) {
+  function markFailure(health, host, error, bytes, elapsedMs) {
     const record = recordOf(health, host);
     const now = Date.now();
+    // 超时、断连同样是「慢」的证据。以前这里只记退避不动分数，于是一个卡死的节点带着
+    // 原封不动的高分熬过退避，立刻又回来当领跑者。
+    markSlow(health, host, bytes, elapsedMs);
     record.fails = (record.fails || 0) + 1;
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
     record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
@@ -720,7 +740,10 @@ const BTR = { VERSION: "0.5.0" };
     for (let index = 0; index < count; index += 1) assignment.push(leader);
     // 隔一阵子留最后一块去试一个还没测过的节点，免得节点记忆永远停在开头那一轮。
     const now = Date.now();
-    const untried = ranked.filter(function (entry) { return entry.bps <= 0; });
+    // 「没测过」要包含「测过但已经过期」，否则热身之后这个分支永远不会触发，节点记忆就停在开头那一轮。
+    const untried = ranked.filter(function (entry) {
+      return entry.bps <= 0 || !isMeasured(health.hosts[entry.host], now);
+    });
     if (untried.length && count >= 4 && now - (Number(health.trialAt) || 0) > TRIAL_INTERVAL_MS) {
       health.trialAt = now;
       assignment[count - 1] = untried[0].host;
@@ -756,17 +779,22 @@ const BTR = { VERSION: "0.5.0" };
   // 一块该多久传完：按已测到的最快节点估，超过它的 1.5 倍还没回来就再向另一个节点要一份
   // 副本，先到先用。上游叫这个 hedge。没有测速数据时用固定值。
   function hedgeDelayMs(plan, piece) {
-    const now = Date.now();
-    let best = 0;
-    Object.keys(plan.health.hosts).forEach(function (host) {
-      const record = plan.health.hosts[host];
-      if (isMeasured(record, now) && record.bps > best) best = record.bps;
-    });
-    if (!best) return piece.trial ? 600 : 1200;
-    const estimate = Math.round(piece.length / best * 1000 * 1.5);
-    // 试探用的那块：最多让它拖半秒，之后就让最快的节点也下一份。
-    if (piece.trial) return Math.max(300, Math.min(700, estimate));
-    return Math.max(400, Math.min(2500, estimate));
+    const host = plan.assignment[piece.index] || "";
+    const record = host ? plan.health.hosts[host] : null;
+    // 先看这块实际派给的那个节点自己一块要跑多久；这比拿全场最快速度去估准得多。
+    let estimate = record && record.pieceMs > 0 ? Math.round(record.pieceMs * 1.5 + 120) : 0;
+    if (!estimate) {
+      const now = Date.now();
+      let best = 0;
+      Object.keys(plan.health.hosts).forEach(function (item) {
+        const other = plan.health.hosts[item];
+        if (isMeasured(other, now) && other.bps > best) best = other.bps;
+      });
+      estimate = best ? Math.round(piece.length / best * 1000 * 1.5) : 0;
+    }
+    // 试探用的那块：最多让它拖半秒，之后就让领跑者也下一份。
+    if (piece.trial) return estimate ? Math.max(300, Math.min(700, estimate)) : 600;
+    return estimate ? Math.max(400, Math.min(2500, estimate)) : 1200;
   }
 
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
@@ -783,7 +811,8 @@ const BTR = { VERSION: "0.5.0" };
     for (let round = 0; round < RETRY_ROUNDS; round += 1) order.forEach(function (host) { queue.push({ host, round }); });
     return new Promise(function (resolve, reject) {
       let settled = false;
-      let running = 0;
+      // 在途的每次尝试都记下是谁、什么时候发的：开副本那一刻要靠它写悲观上界。
+      const running = [];
       let cursor = 0;
       let timer = null;
       let lastError = null;
@@ -810,7 +839,7 @@ const BTR = { VERSION: "0.5.0" };
         return null;
       }
       function giveUp(error) {
-        if (running > 0) return;
+        if (running.length) return;
         finish(false, error);
       }
       function launch(isHedge) {
@@ -823,20 +852,25 @@ const BTR = { VERSION: "0.5.0" };
         // 整段的重试预算：平均每块三次。所有节点都拒绝同一个地址时，不必让每块把每个节点都
         // 试两遍，早点交回原连接。
         if (plan.attempts >= plan.attemptBudget) {
-          if (running === 0) plan.aborted = true;
+          if (!running.length) plan.aborted = true;
           giveUp(lastError || env.makeError("Budget", "重试次数已用完"));
           return;
         }
         const host = nextHost();
         if (!host) { giveUp(lastError || env.makeError("NoHosts", "没有可用的 CDN 节点")); return; }
-        running += 1;
+        const attempt = { host, at: now };
+        running.push(attempt);
         plan.inflight += 1;
         plan.attempts += 1;
         if (isHedge) plan.hedges += 1;
+        const drop = function () {
+          const index = running.indexOf(attempt);
+          if (index >= 0) running.splice(index, 1);
+          plan.inflight -= 1;
+        };
         const url = core.buildUrl(plan.parts, { host, port: "", scheme: plan.scheme });
         fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
-          running -= 1;
-          plan.inflight -= 1;
+          drop();
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
           env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + Math.round(result.bytes.byteLength / result.elapsedMs) + "KB/s" + (settled ? "（副本落败）" : ""));
           if (settled) return;
@@ -845,14 +879,14 @@ const BTR = { VERSION: "0.5.0" };
           result.host = host;
           finish(true, result);
         }, function (error) {
-          running -= 1;
-          plan.inflight -= 1;
+          const waitedMs = Date.now() - attempt.at;
+          drop();
           if (!error || HOST_ERRORS.indexOf(error.name) < 0) {
             plan.aborted = true;
             finish(false, error || env.makeError("ScriptError", "未知错误"));
             return;
           }
-          markFailure(plan.health, host, error);
+          markFailure(plan.health, host, error, piece.length, waitedMs);
           env.log("debug", "子块 " + piece.index + " 在 " + host + " 失败", error);
           lastError = error;
           if (!settled) launch(false);
@@ -861,11 +895,16 @@ const BTR = { VERSION: "0.5.0" };
       }
       function scheduleHedge() {
         clearHedge();
-        if (settled || !env.api.setTimeout || running >= plan.hedgeMax) return;
+        if (settled || !env.api.setTimeout || running.length >= plan.hedgeMax) return;
         timer = env.api.setTimeout(function () {
           timer = null;
+          if (settled) return;
+          // 到这里就已经能断定：还在途的这几次尝试，各自的节点这一块至少用了这么久。
+          // 这是 $done 之前唯一一次能把「慢」记进节点记忆的机会。
+          const at = Date.now();
+          running.forEach(function (item) { markSlow(plan.health, item.host, piece.length, at - item.at); });
           // 整段同时在途的请求有上限，满了就不开副本，改为再等一个周期。
-          if (settled || running >= plan.hedgeMax) return;
+          if (running.length >= plan.hedgeMax) return;
           if (plan.inflight >= plan.maxInflight) { scheduleHedge(); return; }
           launch(true);
         }, hedgeDelayMs(plan, piece));
@@ -934,8 +973,9 @@ const BTR = { VERSION: "0.5.0" };
     });
     if (offset !== context.range.length) throw env.makeError("BadLength", "拼接后长度不符：" + offset + "/" + context.range.length);
     const elapsedMs = Math.max(1, Date.now() - startedAt);
-    // 这一段基本由一个节点拿下时，把整段的吞吐记在它头上，下一次选领跑者就按这个来。
-    markSegment(context.health, plan.usage, context.range.length, elapsedMs);
+    // 整段的成绩记在「我们把这一段押给谁」头上，而不是最后谁交的块最多：押错了人就该算它的账，
+    // 不然被副本救回来的慢段会被记成救场那个节点的成绩，慢的那个反而全身而退。
+    markSegment(context.health, plan.assignment[0], context.range.length, elapsedMs);
     return {
       bytes: output,
       total,
@@ -993,11 +1033,13 @@ const BTR = { VERSION: "0.5.0" };
     assignPieces,
     downloadRange,
     fetchPiece,
+    hedgeDelayMs,
     loadHealth,
     chooseLeader,
     hostScore,
     markFailure,
     markSegment,
+    markSlow,
     markSuccess,
     orderCandidates,
     probeHost,
