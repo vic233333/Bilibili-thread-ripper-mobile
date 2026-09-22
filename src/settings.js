@@ -459,14 +459,16 @@
       ? "<div class=warn>还没有可用的视频地址。先在 B 站 App 里播放一个视频，再回到这里。地址两小时内有效。</div>"
       : "<div class=sub>用最近一次" + (lastMedia.kind === "video" ? "画面" : "音轨") + "分片的地址，向每个节点下载 256 KiB，逐个节点进行。前几行是 App 自己用过的节点，也就是不装脚本时的基线；其余是脚本会换到的节点。测速也会更新“节点记忆”里的速度。</div>"
         + "<div class=sub style=\"margin:8px 0\">并发数：<select id=lanes><option value=1>单连接</option><option value=4>4 路并发</option><option value=8 selected>8 路并发</option></select>"
-        + "　并发档位下“速度”是几条连接合起来的吞吐。<b>同一节点 8 路合计明显高于单连接，多线程才有意义；合计和单连接差不多，说明线路有总带宽上限，拆分帮不上忙。</b></div>"
+        + "　每路大小：<select id=bytes><option value=131072>128 KiB</option><option value=262144 selected>256 KiB</option><option value=1048576>1 MiB</option><option value=2097152>2 MiB</option></select>"
+        + "<br>并发档位下“速度”是几条连接合起来的吞吐。<b>同一节点 8 路合计明显高于单连接，多线程才有意义；合计和单连接差不多，说明线路有总带宽上限。</b>"
+        + "<br>单连接下 1 MiB 的速度远高于 256 KiB，说明每个新连接的握手和慢启动占了大头，那就该拆得更大、更少，或者干脆只换节点不拆。</div>"
         + "<table><tr><th>节点</th><th>耗时</th><th>速度</th><th>结果</th></tr>" + rows + "</table>"
         + "<button id=again type=button style=\"margin-top:12px\">开始测速</button>"
-        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');var lanes=document.getElementById('lanes');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
-        + "function run(i){if(i>=rows.length){btn.disabled=false;lanes.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
-        + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes=262144&parallel='+lanes.value,{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.okLanes?fmt(d.bps)+(d.parallel>1?' 合计':''):'-';"
+        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');var lanes=document.getElementById('lanes');var bytes=document.getElementById('bytes');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
+        + "function run(i){if(i>=rows.length){btn.disabled=false;lanes.disabled=false;bytes.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
+        + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes='+bytes.value+'&parallel='+lanes.value,{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.okLanes?fmt(d.bps)+(d.parallel>1?' 合计':''):'-';"
         + "var per=(d.laneBps||[]).filter(function(x){return x>0;}).map(function(x){return Math.round(x/1024);});row.querySelector('[data-cell=note]').textContent=d.ok?(d.parallel>1?'正常，每路 '+per.join('/')+' KB/s':'正常'):(d.okLanes?d.okLanes+'/'+d.parallel+' 路成功，'+(d.error||''):(d.error||'失败'));}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
-        + "btn.addEventListener('click',function(){btn.disabled=true;lanes.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});})();</script>";
+        + "btn.addEventListener('click',function(){btn.disabled=true;lanes.disabled=true;bytes.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});})();</script>";
     return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>节点测速</title>"
       + "<style>body{margin:0;padding:16px;font:15px/1.5 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}h1{font-size:20px;margin:0 0 8px}.sub{color:#61666d;font-size:13px;margin-bottom:12px}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:12px}th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500}td.num{text-align:right;white-space:nowrap}td.host{word-break:break-all}small{color:#9499a0}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:10px;background:#fb7299;color:#fff}button:disabled{opacity:.5}a{color:#fb7299}</style></head><body>"
       + "<h1>节点测速</h1><div class=sub><a href=\"/\">← 返回设置</a></div>" + body + "</body></html>";
@@ -479,6 +481,8 @@
     if (!host) return jsonResponse({ ok: false, error: "节点名不合法" });
     const bytes = Math.max(64 * 1024, Math.min(2 * 1024 * 1024, Math.trunc(Number(query.bytes)) || 256 * 1024));
     const parallel = Math.max(1, Math.min(16, Math.trunc(Number(query.parallel)) || 1));
+    // 单次测速的总量不超过 8 MiB，脚本环境的内存有限。
+    if (bytes * parallel > 8 * 1024 * 1024) return jsonResponse({ ok: false, error: "并发数乘每路大小不能超过 8 MiB" });
     const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1" };
     if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
     const health = BTR.accelerator.loadHealth();

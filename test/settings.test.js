@@ -180,7 +180,9 @@ test("节点测速：没有视频地址时提示，有地址时逐个节点测�
     assert.ok(pageHtml.includes("upos-hz-mirrorakam.akamaized.net"), "App 原本用的节点在表里");
     assert.ok(pageHtml.indexOf("upos-sz-mirrorcosov.bilivideo.com") < pageHtml.indexOf("data-host=\"upos-sz-mirrorali.bilivideo.com\""), "原节点排在前面");
     assert.ok((pageHtml.match(/App 原本用的节点（基线）/g) || []).length === 2);
-    assert.ok(pageHtml.includes("id=lanes"), "有并发档位");
+    assert.ok(pageHtml.includes("id=lanes") && pageHtml.includes("id=bytes"), "有并发与大小档位");
+    const tooBig = JSON.parse((await env.run(page("/speedtest/run?host=upos-sz-mirrorali.bilivideo.com&bytes=2097152&parallel=8"))).value.response.body);
+    assert.equal(tooBig.ok, false);
     server.requests = [];
     server.setBehavior("upos-sz-mirrorhw.bilivideo.com", { status: 403 });
     const ok = JSON.parse((await env.run(page("/speedtest/run?host=upos-sz-mirrorali.bilivideo.com&bytes=262144"))).value.response.body);
