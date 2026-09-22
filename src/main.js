@@ -53,7 +53,7 @@
     if (method !== "GET") return pass("notGet");
     if (!core.isMediaUrl(parts) || !core.isUposPath(parts)) return pass("notMedia");
     // 给设置页的节点测速留一个真实地址。只存在本机。
-    settingsModule.rememberMedia(parts.href, core.headerGet(headers, "user-agent"));
+    settingsModule.rememberMedia(parts.href, core.headerGet(headers, "user-agent"), entry.kind, parts.host);
     const range = core.parseRangeHeader(core.headerGet(headers, "range"));
     entry.range = range.kind === "bounded" ? range.start + "-" + range.end : (range.raw || "(无)").slice(0, 40);
     if (range.kind === "bounded") entry.length = range.length;

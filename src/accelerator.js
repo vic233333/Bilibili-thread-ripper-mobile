@@ -360,21 +360,41 @@
     };
   }
 
-  // 节点测速：用一个真实的签名地址，向指定节点单连接下一段，返回速度。设置页的测速表用它。
-  async function probeHost(mediaUrl, host, headers, bytes, timeoutSec, health) {
+  // 节点测速：用一个真实的签名地址，向指定节点同时开 parallel 条连接，各下 bytes 字节的不同区间，
+  // 返回合计速度和每条连接的速度。parallel 为 1 就是单连接。设置页的测速表用它。
+  // 多条连接合起来能不能超过单条，是判断多线程在这条线路上有没有意义的关键。
+  async function probeHost(mediaUrl, host, headers, bytes, timeoutSec, health, parallel) {
     const parts = core.parseUrl(mediaUrl);
     if (!parts) throw env.makeError("BadUrl", "没有可用的视频地址");
     const url = core.buildUrl(parts, { host, port: "" });
-    const piece = { index: 0, start: 0, end: Math.max(1, bytes) - 1, length: Math.max(1, bytes) };
+    const size = Math.max(1, bytes);
+    const lanes = Math.max(1, Math.min(16, Math.trunc(parallel) || 1));
     const startedAt = Date.now();
-    try {
-      const result = await fetchPiece(url, piece, headers, timeoutSec);
-      if (health) markSuccess(health, host, result.bytes.byteLength, result.elapsedMs);
-      return { host, ok: true, bytes: result.bytes.byteLength, elapsedMs: result.elapsedMs, bps: Math.round(result.bytes.byteLength * 1000 / result.elapsedMs) };
-    } catch (error) {
-      if (health && error && HOST_ERRORS.indexOf(error.name) >= 0) markFailure(health, host, error);
-      return { host, ok: false, elapsedMs: Date.now() - startedAt, error: env.safeString(error).slice(0, 120) };
-    }
+    const results = await Promise.all(Array.from({ length: lanes }, function (_item, index) {
+      const piece = { index, start: index * size, end: (index + 1) * size - 1, length: size };
+      return fetchPiece(url, piece, headers, timeoutSec).then(function (result) {
+        if (health) markSuccess(health, host, result.bytes.byteLength, result.elapsedMs);
+        return { ok: true, bytes: result.bytes.byteLength, elapsedMs: result.elapsedMs, bps: Math.round(result.bytes.byteLength * 1000 / result.elapsedMs) };
+      }, function (error) {
+        if (health && error && HOST_ERRORS.indexOf(error.name) >= 0) markFailure(health, host, error);
+        return { ok: false, elapsedMs: Date.now() - startedAt, error: env.safeString(error).slice(0, 120) };
+      });
+    }));
+    const elapsedMs = Math.max(1, Date.now() - startedAt);
+    const okLanes = results.filter(function (item) { return item.ok; });
+    const totalBytes = okLanes.reduce(function (sum, item) { return sum + item.bytes; }, 0);
+    return {
+      host,
+      parallel: lanes,
+      ok: okLanes.length === lanes,
+      okLanes: okLanes.length,
+      bytes: totalBytes,
+      elapsedMs,
+      // 合计速度按整体耗时算：这才是播放器实际能拿到的吞吐。
+      bps: Math.round(totalBytes * 1000 / elapsedMs),
+      laneBps: results.map(function (item) { return item.ok ? item.bps : 0; }),
+      error: okLanes.length === lanes ? "" : results.filter(function (item) { return !item.ok; }).map(function (item) { return item.error; })[0]
+    };
   }
 
   BTR.accelerator = Object.freeze({

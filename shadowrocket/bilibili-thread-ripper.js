@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.8
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.9
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.8" };
+const BTR = { VERSION: "0.1.9" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -845,21 +845,41 @@ const BTR = { VERSION: "0.1.8" };
     };
   }
 
-  // 节点测速：用一个真实的签名地址，向指定节点单连接下一段，返回速度。设置页的测速表用它。
-  async function probeHost(mediaUrl, host, headers, bytes, timeoutSec, health) {
+  // 节点测速：用一个真实的签名地址，向指定节点同时开 parallel 条连接，各下 bytes 字节的不同区间，
+  // 返回合计速度和每条连接的速度。parallel 为 1 就是单连接。设置页的测速表用它。
+  // 多条连接合起来能不能超过单条，是判断多线程在这条线路上有没有意义的关键。
+  async function probeHost(mediaUrl, host, headers, bytes, timeoutSec, health, parallel) {
     const parts = core.parseUrl(mediaUrl);
     if (!parts) throw env.makeError("BadUrl", "没有可用的视频地址");
     const url = core.buildUrl(parts, { host, port: "" });
-    const piece = { index: 0, start: 0, end: Math.max(1, bytes) - 1, length: Math.max(1, bytes) };
+    const size = Math.max(1, bytes);
+    const lanes = Math.max(1, Math.min(16, Math.trunc(parallel) || 1));
     const startedAt = Date.now();
-    try {
-      const result = await fetchPiece(url, piece, headers, timeoutSec);
-      if (health) markSuccess(health, host, result.bytes.byteLength, result.elapsedMs);
-      return { host, ok: true, bytes: result.bytes.byteLength, elapsedMs: result.elapsedMs, bps: Math.round(result.bytes.byteLength * 1000 / result.elapsedMs) };
-    } catch (error) {
-      if (health && error && HOST_ERRORS.indexOf(error.name) >= 0) markFailure(health, host, error);
-      return { host, ok: false, elapsedMs: Date.now() - startedAt, error: env.safeString(error).slice(0, 120) };
-    }
+    const results = await Promise.all(Array.from({ length: lanes }, function (_item, index) {
+      const piece = { index, start: index * size, end: (index + 1) * size - 1, length: size };
+      return fetchPiece(url, piece, headers, timeoutSec).then(function (result) {
+        if (health) markSuccess(health, host, result.bytes.byteLength, result.elapsedMs);
+        return { ok: true, bytes: result.bytes.byteLength, elapsedMs: result.elapsedMs, bps: Math.round(result.bytes.byteLength * 1000 / result.elapsedMs) };
+      }, function (error) {
+        if (health && error && HOST_ERRORS.indexOf(error.name) >= 0) markFailure(health, host, error);
+        return { ok: false, elapsedMs: Date.now() - startedAt, error: env.safeString(error).slice(0, 120) };
+      });
+    }));
+    const elapsedMs = Math.max(1, Date.now() - startedAt);
+    const okLanes = results.filter(function (item) { return item.ok; });
+    const totalBytes = okLanes.reduce(function (sum, item) { return sum + item.bytes; }, 0);
+    return {
+      host,
+      parallel: lanes,
+      ok: okLanes.length === lanes,
+      okLanes: okLanes.length,
+      bytes: totalBytes,
+      elapsedMs,
+      // 合计速度按整体耗时算：这才是播放器实际能拿到的吞吐。
+      bps: Math.round(totalBytes * 1000 / elapsedMs),
+      laneBps: results.map(function (item) { return item.ok ? item.bps : 0; }),
+      error: okLanes.length === lanes ? "" : results.filter(function (item) { return !item.ok; }).map(function (item) { return item.error; })[0]
+    };
   }
 
   BTR.accelerator = Object.freeze({
@@ -989,13 +1009,26 @@ const BTR = { VERSION: "0.1.8" };
     return env.store.writeJson(LOG_KEY, log);
   }
 
-  function rememberMedia(url, userAgent) {
-    return env.store.writeJson(LAST_MEDIA_KEY, { url, userAgent: userAgent || "", at: Date.now() });
+  // 优先记画面分片的地址（文件大，测速时多路并发的偏移不会越界）；音轨地址只在没有画面地址时凑数。
+  // 同时记下 App 自己用过的原节点，测速表把它们都列为基线。
+  function rememberMedia(url, userAgent, kind, originalHost) {
+    const current = loadLastMedia() || { originalHosts: [] };
+    const hosts = Array.isArray(current.originalHosts) ? current.originalHosts.slice() : [];
+    if (originalHost && hosts.indexOf(originalHost) < 0) hosts.unshift(originalHost);
+    const keepCurrent = current.url && current.kind === "video" && kind !== "video";
+    return env.store.writeJson(LAST_MEDIA_KEY, {
+      url: keepCurrent ? current.url : url,
+      kind: keepCurrent ? current.kind : kind || "",
+      userAgent: userAgent || current.userAgent || "",
+      originalHosts: hosts.slice(0, 4),
+      at: Date.now()
+    });
   }
 
   function loadLastMedia() {
     const stored = env.store.readJson(LAST_MEDIA_KEY, null);
     if (!stored || typeof stored.url !== "string" || Date.now() - (stored.at || 0) > LAST_MEDIA_TTL_MS) return null;
+    if (!Array.isArray(stored.originalHosts)) stored.originalHosts = [];
     return stored;
   }
 
@@ -1312,22 +1345,27 @@ const BTR = { VERSION: "0.1.8" };
   // 每次 run 都是一次独立的脚本运行，不会撞上设置页脚本的 10 秒时限。
   function renderSpeedtest(settings, lastMedia) {
     const original = lastMedia ? core.parseUrl(lastMedia.url) : null;
-    const hosts = [];
-    if (original) hosts.push(original.host);
+    const originals = [];
+    if (original) originals.push(original.host);
+    (lastMedia && lastMedia.originalHosts || []).forEach(function (host) { if (originals.indexOf(host) < 0) originals.push(host); });
+    const hosts = originals.slice();
     core.MAINLAND_HOSTS.concat(core.OVERSEAS_HOSTS, settings.customHosts).forEach(function (host) { if (hosts.indexOf(host) < 0) hosts.push(host); });
     const rows = hosts.map(function (host) {
-      const label = original && host === original.host ? "<br><small>App 原本用的节点（基线）</small>" : core.MAINLAND_HOSTS.indexOf(host) >= 0 ? "<br><small>大陆</small>" : core.OVERSEAS_HOSTS.indexOf(host) >= 0 ? "<br><small>海外</small>" : "<br><small>自定义</small>";
+      const label = originals.indexOf(host) >= 0 ? "<br><small>App 原本用的节点（基线）</small>" : core.MAINLAND_HOSTS.indexOf(host) >= 0 ? "<br><small>大陆</small>" : core.OVERSEAS_HOSTS.indexOf(host) >= 0 ? "<br><small>海外</small>" : "<br><small>自定义</small>";
       return "<tr data-host=\"" + escapeHtml(host) + "\"><td class=host>" + escapeHtml(host) + label + "</td><td class=num data-cell=ms>-</td><td class=num data-cell=speed>-</td><td data-cell=note>等待</td></tr>";
     }).join("");
     const body = !original
       ? "<div class=warn>还没有可用的视频地址。先在 B 站 App 里播放一个视频，再回到这里。地址两小时内有效。</div>"
-      : "<div class=sub>用最近一次视频的地址，向每个节点单连接下载 256 KiB，逐个进行，约需一两分钟。第一行是 App 原本用的节点，其余是脚本会换到的节点。测速也会更新“节点记忆”里的速度。</div>"
+      : "<div class=sub>用最近一次" + (lastMedia.kind === "video" ? "画面" : "音轨") + "分片的地址，向每个节点下载 256 KiB，逐个节点进行。前几行是 App 自己用过的节点，也就是不装脚本时的基线；其余是脚本会换到的节点。测速也会更新“节点记忆”里的速度。</div>"
+        + "<div class=sub style=\"margin:8px 0\">并发数：<select id=lanes><option value=1>单连接</option><option value=4>4 路并发</option><option value=8 selected>8 路并发</option></select>"
+        + "　并发档位下“速度”是几条连接合起来的吞吐。<b>同一节点 8 路合计明显高于单连接，多线程才有意义；合计和单连接差不多，说明线路有总带宽上限，拆分帮不上忙。</b></div>"
         + "<table><tr><th>节点</th><th>耗时</th><th>速度</th><th>结果</th></tr>" + rows + "</table>"
-        + "<button id=again type=button style=\"margin-top:12px\">再测一次</button>"
-        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
-        + "function run(i){if(i>=rows.length){btn.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
-        + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes=262144',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.ok?fmt(d.bps):'-';row.querySelector('[data-cell=note]').textContent=d.ok?'正常':(d.error||'失败');}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
-        + "btn.addEventListener('click',function(){btn.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});btn.disabled=true;run(0);})();</script>";
+        + "<button id=again type=button style=\"margin-top:12px\">开始测速</button>"
+        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');var lanes=document.getElementById('lanes');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
+        + "function run(i){if(i>=rows.length){btn.disabled=false;lanes.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
+        + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes=262144&parallel='+lanes.value,{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.okLanes?fmt(d.bps)+(d.parallel>1?' 合计':''):'-';"
+        + "var per=(d.laneBps||[]).filter(function(x){return x>0;}).map(function(x){return Math.round(x/1024);});row.querySelector('[data-cell=note]').textContent=d.ok?(d.parallel>1?'正常，每路 '+per.join('/')+' KB/s':'正常'):(d.okLanes?d.okLanes+'/'+d.parallel+' 路成功，'+(d.error||''):(d.error||'失败'));}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
+        + "btn.addEventListener('click',function(){btn.disabled=true;lanes.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});})();</script>";
     return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>节点测速</title>"
       + "<style>body{margin:0;padding:16px;font:15px/1.5 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}h1{font-size:20px;margin:0 0 8px}.sub{color:#61666d;font-size:13px;margin-bottom:12px}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:12px}th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500}td.num{text-align:right;white-space:nowrap}td.host{word-break:break-all}small{color:#9499a0}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:10px;background:#fb7299;color:#fff}button:disabled{opacity:.5}a{color:#fb7299}</style></head><body>"
       + "<h1>节点测速</h1><div class=sub><a href=\"/\">← 返回设置</a></div>" + body + "</body></html>";
@@ -1339,10 +1377,11 @@ const BTR = { VERSION: "0.1.8" };
     if (!lastMedia) return jsonResponse({ ok: false, error: "还没有可用的视频地址，先播放一个视频" });
     if (!host) return jsonResponse({ ok: false, error: "节点名不合法" });
     const bytes = Math.max(64 * 1024, Math.min(2 * 1024 * 1024, Math.trunc(Number(query.bytes)) || 256 * 1024));
+    const parallel = Math.max(1, Math.min(16, Math.trunc(Number(query.parallel)) || 1));
     const headers = { "Accept-Encoding": "identity", "X-BTR-Sub": "1" };
     if (lastMedia.userAgent) headers["User-Agent"] = lastMedia.userAgent;
     const health = BTR.accelerator.loadHealth();
-    const result = await BTR.accelerator.probeHost(lastMedia.url, host, headers, bytes, 8, health);
+    const result = await BTR.accelerator.probeHost(lastMedia.url, host, headers, bytes, 9, health, parallel);
     BTR.accelerator.saveHealth(health);
     return jsonResponse(result);
   }
@@ -1489,7 +1528,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
     if (method !== "GET") return pass("notGet");
     if (!core.isMediaUrl(parts) || !core.isUposPath(parts)) return pass("notMedia");
     // 给设置页的节点测速留一个真实地址。只存在本机。
-    settingsModule.rememberMedia(parts.href, core.headerGet(headers, "user-agent"));
+    settingsModule.rememberMedia(parts.href, core.headerGet(headers, "user-agent"), entry.kind, parts.host);
     const range = core.parseRangeHeader(core.headerGet(headers, "range"));
     entry.range = range.kind === "bounded" ? range.start + "-" + range.end : (range.raw || "(无)").slice(0, 40);
     if (range.kind === "bounded") entry.length = range.length;
