@@ -160,15 +160,19 @@
     return { mode: stats && stats.schemes && stats.schemes.https ? "https" : "http", declared: false };
   }
 
-  // https 版装好了却一直没有 https 分片进来，多半是解密没生效：证书没装、没信任，或域名不在解密列表里。
+  // https 版装好了却没有 https 分片进来，多半是解密没生效：证书没装、没信任，或域名不在解密列表里。
+  // 解密没生效时 https 分片压根到不了脚本，所以只能靠“缺席”判断：
+  //   "recent"：最近十分钟收到过明文分片，却没有 https 分片，几乎可以肯定解密没生效；
+  //   "never"：从来没收到过 https 分片，可能是还没播放，也可能是解密没生效，给一条常驻提示。
   function httpsProblem(mode, stats) {
     if (mode.mode !== "https" || !mode.declared) return "";
     const now = Date.now();
     const window = 10 * 60 * 1000;
     const httpRecently = stats.lastHttpAt && now - stats.lastHttpAt < window;
     const httpsRecently = stats.lastHttpsAt && now - stats.lastHttpsAt < window;
-    if (httpRecently && !httpsRecently) return "recent";
-    if (!stats.lastHttpsAt && stats.seen > 20) return "never";
+    if (httpsRecently) return "";
+    if (httpRecently) return "recent";
+    if (!stats.lastHttpsAt) return "never";
     return "";
   }
 
@@ -299,8 +303,11 @@
     const modeBadge = "<span class=\"badge" + (mode.mode === "https" ? " on" : "") + "\">" + (mode.mode === "https" ? "http + https 模式" : "http 明文模式") + "</span>";
     const problem = httpsProblem(mode, stats);
     const httpsWarning = problem
-      ? "<div class=warn><b>https 版已装好，但脚本没有收到任何 https 分片"
-        + (problem === "recent" ? "（最近十分钟只有明文分片进来）" : "") + "。</b>多半是 HTTPS 解密没有真正生效，逐项检查："
+      ? "<div class=" + (problem === "recent" ? "warn" : "sub") + " style=\"" + (problem === "recent" ? "" : "background:#eef1f6;border-radius:10px;padding:10px 14px;margin:12px 0") + "\"><b>"
+        + (problem === "recent"
+          ? "https 版已装好，但最近十分钟只收到了明文分片，没有任何 https 分片。"
+          : "https 版已启用，但脚本还没收到过任何 https 分片。")
+        + "</b>" + (problem === "recent" ? "几乎可以肯定 HTTPS 解密没有真正生效。" : "如果你已经播放过视频，说明解密没有生效；解密没生效时 https 分片根本到不了脚本，这里不会有任何记录。") + "逐项检查："
         + "<ol style=\"margin:8px 0 0;padding-left:20px\">"
         + "<li>配置 → 点当前配置文件右侧的 ⓘ → HTTPS 解密：开关是否打开。</li>"
         + "<li>同一页「域名」列表里必须有 <code>*.bilivideo.com</code>、<code>*.bilivideo.cn</code>、<code>*.bilivideo.net</code>、<code>*.akamaized.net</code>。只有 <code>*.bilibili.com</code> 是不够的，视频分片不走那个域名。</li>"

@@ -232,19 +232,23 @@ test("设置页显示模式徽标；https 版长时间只收到明文分片时�
     assert.ok(html.includes("http 明文模式"));
     assert.ok(!html.includes("没有收到任何 https 分片"));
     assert.ok(!html.includes("按看到过的协议推断"));
-    // https 版但只有明文进来：提示。
+    // https 版、还没有任何分片：常驻的温和提示。
     store = createStore();
     env = createEnv({ server, store, argument: "mode=https" });
-    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
     html = (await env.run(page("/"))).value.response.body;
     assert.ok(html.includes("http + https 模式"));
-    assert.ok(html.includes("没有收到任何 https 分片"));
+    assert.ok(html.includes("还没收到过任何 https 分片"));
+    assert.ok(!html.includes("只收到了明文分片"));
+    // 只有明文进来：升级为醒目警告。
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    html = (await env.run(page("/"))).value.response.body;
+    assert.ok(html.includes("只收到了明文分片，没有任何 https 分片"));
     assert.ok(html.includes("*.bilivideo.com"));
     // https 分片进来了：提示消失，行首有锁。
     const httpsUrl = "https://" + MEDIA_URL.slice("http://".length);
     await env.run(mediaRequest({ url: httpsUrl, headers: { Range: "bytes=0-1048575" } }));
     html = (await env.run(page("/"))).value.response.body;
-    assert.ok(!html.includes("没有收到任何 https 分片"));
+    assert.ok(!html.includes("https 分片。</b>") && !html.includes("还没收到过任何 https 分片"));
     assert.ok(html.includes("🔒 upos-hz-mirrorakam"));
     const stats = store.json("btr.stats");
     assert.deepEqual(stats.schemes, { http: 1, https: 1 });
