@@ -435,7 +435,7 @@
         fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
           drop();
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
-          env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + Math.round(result.bytes.byteLength / result.elapsedMs) + "KB/s" + (settled ? "（副本落败）" : ""));
+          env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + (result.bytes.byteLength / result.elapsedMs / 1000).toFixed(2) + "MB/s" + (settled ? "（副本落败）" : ""));
           if (settled) return;
           plan.usage[host] = (plan.usage[host] || 0) + 1;
           plan.pieceMs.push(result.elapsedMs);

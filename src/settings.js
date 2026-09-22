@@ -462,7 +462,8 @@
   function formatSpeed(bps) {
     const value = Number(bps) || 0;
     if (!value) return "-";
-    return (value / 1024 / 1024).toFixed(2) + " MiB/s";
+    // 速度统一按十进制 MB/s（1 MB = 1000000 字节），跟测速软件、运营商的口径一致（乘 8 就是 Mbps）。
+    return (value / 1e6).toFixed(2) + " MB/s";
   }
 
   function formatTime(at) {
@@ -712,10 +713,10 @@
         + "<br>单连接下 1 MiB 的速度远高于 256 KiB，说明每个新连接的握手和慢启动占了大头，那就该拆得更大、更少，或者干脆只换节点不拆。</div>"
         + "<table><tr><th>节点</th><th>耗时</th><th>速度</th><th>结果</th></tr>" + rows + "</table>"
         + "<button id=again type=button style=\"margin-top:12px\">开始测速</button>"
-        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');var lanes=document.getElementById('lanes');var bytes=document.getElementById('bytes');function fmt(b){return b?(b/1024/1024).toFixed(2)+' MiB/s':'-';}"
+        + "<script>(function(){var rows=[].slice.call(document.querySelectorAll('tr[data-host]'));var btn=document.getElementById('again');var lanes=document.getElementById('lanes');var bytes=document.getElementById('bytes');function fmt(b){return b?(b/1e6).toFixed(2)+' MB/s':'-';}"
         + "function run(i){if(i>=rows.length){btn.disabled=false;lanes.disabled=false;bytes.disabled=false;return;}var row=rows[i];var host=row.getAttribute('data-host');row.querySelector('[data-cell=note]').textContent='测速中…';"
         + "fetch('/speedtest/run?host='+encodeURIComponent(host)+'&bytes='+bytes.value+'&parallel='+lanes.value,{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){row.querySelector('[data-cell=ms]').textContent=(d.elapsedMs||0)+' ms';row.querySelector('[data-cell=speed]').textContent=d.okLanes?fmt(d.bps)+(d.parallel>1?' 合计':''):'-';"
-        + "var per=(d.laneBps||[]).filter(function(x){return x>0;}).map(function(x){return Math.round(x/1024);});row.querySelector('[data-cell=note]').textContent=d.ok?(d.parallel>1?'正常，每路 '+per.join('/')+' KB/s':'正常'):(d.okLanes?d.okLanes+'/'+d.parallel+' 路成功，'+(d.error||''):(d.error||'失败'));}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
+        + "var per=(d.laneBps||[]).filter(function(x){return x>0;}).map(function(x){return (x/1e6).toFixed(2);});row.querySelector('[data-cell=note]').textContent=d.ok?(d.parallel>1?'正常，每路 '+per.join('/')+' MB/s':'正常'):(d.okLanes?d.okLanes+'/'+d.parallel+' 路成功，'+(d.error||''):(d.error||'失败'));}).catch(function(e){row.querySelector('[data-cell=note]').textContent='请求失败：'+e;}).then(function(){run(i+1);});}"
         + "btn.addEventListener('click',function(){btn.disabled=true;lanes.disabled=true;bytes.disabled=true;rows.forEach(function(r){r.querySelector('[data-cell=ms]').textContent='-';r.querySelector('[data-cell=speed]').textContent='-';r.querySelector('[data-cell=note]').textContent='等待';});run(0);});})();</script>";
     return "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>节点测速</title>"
       + "<style>body{margin:0;padding:16px;font:15px/1.5 -apple-system,\"PingFang SC\",sans-serif;background:#f4f5f7;color:#18191c}h1{font-size:20px;margin:0 0 8px}.sub{color:#61666d;font-size:13px;margin-bottom:12px}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:12px}th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{color:#61666d;font-weight:500}td.num{text-align:right;white-space:nowrap}td.host{word-break:break-all}small{color:#9499a0}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:10px;background:#fb7299;color:#fff}button:disabled{opacity:.5}a{color:#fb7299}</style></head><body>"

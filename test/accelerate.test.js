@@ -204,8 +204,11 @@ test("一个节点很慢时，超过预计时间就再向别的节点要一份�
   const health = store.json("btr.health");
   const measured = Object.keys(health.hosts).filter((host) => health.hosts[host].measuredAt);
   assert.ok(measured.length >= 4, "热身应测出多个节点的速度");
-  // 让测速最快的那个节点变得极慢：它会被分到块，但副本会救回来。
-  const fastest = measured.sort((a, b) => health.hosts[b].bps - health.hosts[a].bps)[0];
+  // 让这一段的领跑者变得极慢：它会拿到块，但副本会救回来。自动模式下领跑者是 App 自己的节点
+  // （本地各节点速度差不多，没有谁快到三倍）；以前这里挑「测速最快的」，那个节点不一定拿得到块，
+  // 测试就会随机地一个副本都不开。
+  const fastest = "upos-hz-mirrorakam.akamaized.net";
+  assert.ok(measured.includes(fastest), "热身应测到 App 自己的节点");
   server.setBehavior(fastest, { delayMs: 5000 });
   const env = createEnv({ server, store });
   const { value, elapsedMs } = await env.run(mediaRequest({ headers: { Range: "bytes=1048576-2097151" } }));
