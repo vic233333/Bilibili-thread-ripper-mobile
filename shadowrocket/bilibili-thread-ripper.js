@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.10
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.2.0
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.10" };
+const BTR = { VERSION: "0.2.0" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -158,7 +158,9 @@ const BTR = { VERSION: "0.1.10" };
       enabled: source.enabled !== false,
       // "split" 拆分并发下载；"swap" 只把请求换到当前模式的节点，单连接。真机上排错时用。
       accelerate: source.accelerate === "swap" ? "swap" : "split",
-      mode: source.mode === "overseas" || source.mode === "custom" ? source.mode : "mainland",
+      // "auto"：候选节点是 App 原本给的节点加上全部大陆与海外节点，按测得的速度自动挑；
+      // 其余三种与浏览器版相同。真机上哪组节点快因网络而异，所以默认交给测速决定。
+      mode: ["mainland", "overseas", "custom"].indexOf(source.mode) >= 0 ? source.mode : "auto",
       customHosts,
       threads: THREAD_OPTIONS.indexOf(threads) >= 0 ? threads : 8,
       // 一次请求超过这个大小就不拆分了：整段要先在内存里拼好才能交给播放器。
@@ -180,17 +182,19 @@ const BTR = { VERSION: "0.1.10" };
 
   function hostsForMode(settings) {
     if (settings.mode === "custom" && settings.customHosts.length) return settings.customHosts.slice();
+    if (settings.mode === "auto") return OVERSEAS_HOSTS.concat(MAINLAND_HOSTS);
     return (settings.mode === "overseas" ? OVERSEAS_HOSTS : MAINLAND_HOSTS).slice();
   }
 
   // 一个分片可以向哪些节点要。规则同上游：当前模式的节点列表，加上 B 站原本给的节点
-  // （只在它属于当前模式时保留；海外模式保留 akamai 原地址）。
+  // （只在它属于当前模式时保留；海外模式保留 akamai 原地址；自动模式总是保留）。
   function candidateHosts(originalHost, settings) {
     const original = String(originalHost || "").toLowerCase();
     const hosts = hostsForMode(settings);
     const custom = settings.mode === "custom" ? settings.customHosts : [];
     let keepOriginal;
     if (custom.length) keepOriginal = custom.indexOf(original) >= 0;
+    else if (settings.mode === "auto") keepOriginal = true;
     else if (settings.mode === "overseas") keepOriginal = MAINLAND_HOSTS.indexOf(original) < 0;
     else keepOriginal = MAINLAND_HOSTS.indexOf(original) >= 0;
     const list = keepOriginal ? [original].concat(hosts) : hosts;
@@ -493,8 +497,11 @@ const BTR = { VERSION: "0.1.10" };
   const env = BTR.env;
 
   const HEALTH_KEY = "btr.health";
-  // 测过的速度只算这么久；之后这个节点回到“没测过”的那一组，重新给它机会。
-  const MEASURE_TTL_MS = 90 * 1000;
+  // 测过的速度算“新鲜”的时限：新鲜的节点按速度排进节点池；过了时限的仍保留速度作为先验
+  // （分块时照样按它排），只是排队时让位给新鲜的。每块下载都会刷新速度，所以自我修正得很快。
+  const MEASURE_TTL_MS = 10 * 60 * 1000;
+  // 4xx 是节点明确拒绝了这个地址（比如 akamai 对脚本的子请求返回 403），短时间内重试没有意义。
+  const REFUSED_BLOCK_MS = 5 * 60 * 1000;
   // 只有传够这么多字节的一块才拿来算速度，尾巴太短的会误判。
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
   const RETRY_ROUNDS = 2;
@@ -543,6 +550,8 @@ const BTR = { VERSION: "0.1.10" };
     record.fails = (record.fails || 0) + 1;
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
     record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
+    const status = Number(error && error.status) || 0;
+    if (status >= 400 && status < 500 && status !== 408 && status !== 429) record.blockedUntil = now + REFUSED_BLOCK_MS;
     record.failAt = now;
     record.lastError = env.safeString(error).slice(0, 100);
   }
@@ -579,55 +588,29 @@ const BTR = { VERSION: "0.1.10" };
     };
   }
 
-  // 每块先发给哪个节点。测过速度的节点按速度分份额：快的多拿，不到最快节点八分之一的不拿
-  // （只要还剩两个可用的）；没测过的节点每段最多拿四分之一的块去试。测过的不到两个时还在热身，
-  // 轮着撒。移植自上游“最快的节点拿最多的块”的思路。
+  // 每块先发给哪个节点。块是等长的，一段什么时候拼完由最慢的那块决定，所以不按速度分份额，
+  // 而是只用速度接近最快节点（不低于它六成）的那几个，块在它们之间轮流分。真机上单个节点
+  // 开八路每路速度几乎不变，所以把所有块都压给最快的一两个节点是合算的。
+  // 有测速数据（不论新鲜与否）的节点按速度排；一个字节都没测过的节点每段最多拿一块去试。
+  // 有速度数据的不到两个时还在热身，轮着撒。
+  const USABLE_RATIO = 0.6;
   function assignPieces(pool, health, count) {
-    const now = Date.now();
     const entries = pool.map(function (host) { return { host, record: health.hosts[host] || null }; });
-    const measured = entries.filter(function (entry) { return isMeasured(entry.record, now); })
-      .sort(function (a, b) { return (b.record.bps || 0) - (a.record.bps || 0); });
-    const fresh = entries.filter(function (entry) { return !isMeasured(entry.record, now); });
+    const known = entries.filter(function (entry) { return entry.record && entry.record.bps > 0; })
+      .sort(function (a, b) { return b.record.bps - a.record.bps; });
+    const unknown = entries.filter(function (entry) { return !(entry.record && entry.record.bps > 0); });
     const assignment = [];
-    if (measured.length < 2 || !pool.length) {
+    if (known.length < 2 || !pool.length) {
       for (let index = 0; index < count; index += 1) assignment.push(pool[index % pool.length]);
       return assignment;
     }
-    const best = measured[0].record.bps;
-    let usable = measured.filter(function (entry) { return entry.record.bps >= best / 8; });
-    if (usable.length < 2) usable = measured.slice(0, 2);
-    const trials = Math.min(fresh.length, Math.floor(count / 4));
-    const shares = Math.max(usable.length, count - trials);
-    const total = usable.reduce(function (sum, entry) { return sum + entry.record.bps; }, 0);
-    // 按速度分份额，先取整，再把余下的按小数部分从大到小补上；每个可用节点至少一块。
-    const quota = usable.map(function (entry) {
-      const exact = shares * entry.record.bps / total;
-      return { entry, whole: Math.max(1, Math.floor(exact)), fraction: exact - Math.floor(exact) };
-    });
-    let assigned = quota.reduce(function (sum, item) { return sum + item.whole; }, 0);
-    quota.sort(function (a, b) { return b.fraction - a.fraction; });
-    for (let index = 0; assigned < shares; index = (index + 1) % quota.length) { quota[index].whole += 1; assigned += 1; }
-    while (assigned > shares) {
-      const victim = quota.slice().sort(function (a, b) { return a.entry.record.bps - b.entry.record.bps; }).find(function (item) { return item.whole > 1; });
-      if (!victim) break;
-      victim.whole -= 1;
-      assigned -= 1;
-    }
-    // 交错发出：每一轮从份额最多的节点开始各拿一块，同一节点的块不会挤在一起。
-    const remaining = quota.slice().sort(function (a, b) { return b.whole - a.whole; });
-    while (assignment.length < shares) {
-      let progressed = false;
-      for (let index = 0; index < remaining.length && assignment.length < shares; index += 1) {
-        if (remaining[index].whole > 0) {
-          assignment.push(remaining[index].entry.host);
-          remaining[index].whole -= 1;
-          progressed = true;
-        }
-      }
-      if (!progressed) break;
-    }
-    for (let index = 0; index < trials && assignment.length < count; index += 1) assignment.push(fresh[index].host);
-    while (assignment.length < count) assignment.push(usable[assignment.length % usable.length].host);
+    const best = known[0].record.bps;
+    let usable = known.filter(function (entry) { return entry.record.bps >= best * USABLE_RATIO; });
+    if (!usable.length) usable = known.slice(0, 1);
+    const trials = unknown.length && count >= 4 ? 1 : 0;
+    const shares = count - trials;
+    for (let index = 0; index < shares; index += 1) assignment.push(usable[index % usable.length].host);
+    if (trials) assignment.push(unknown[0].host);
     return assignment.slice(0, count);
   }
 
@@ -927,12 +910,15 @@ const BTR = { VERSION: "0.1.10" };
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 2;
+  const SETTINGS_REVISION = 3;
 
   function loadSettings() {
     const raw = loadRawSettings();
+    const revision = Number(raw.revision) || 1;
     // 第 2 版：每块最小从 256 KiB 改成 128 KiB。第 1 版保存的 256 是当时的默认值，不是用户的选择。
-    if ((Number(raw.revision) || 1) < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
+    if (revision < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
+    // 第 3 版：默认 CDN 模式从大陆改成自动。之前保存的“大陆”是当时的默认值。
+    if (revision < 3 && raw.mode === "mainland") delete raw.mode;
     return core.normalizeSettings(raw);
   }
 
@@ -1285,11 +1271,12 @@ const BTR = { VERSION: "0.1.10" };
       + "<label class=row><span>加速方式<small>多线程出问题时先退回“只换节点”排查</small></span><select name=accelerate>"
       + "<option value=split" + selected(settings.accelerate === "split") + ">多线程拆分</option>"
       + "<option value=swap" + selected(settings.accelerate === "swap") + ">只换节点</option></select></label>"
-      + "<label class=row><span>CDN 模式<small>海外看冷门视频一般选大陆 CDN</small></span><select name=mode>"
+      + "<label class=row><span>CDN 模式<small>自动：App 原本的节点加全部大陆、海外节点一起测速，只用最快的几个。哪组快因网络而异，先跑一次节点测速</small></span><select name=mode>"
+      + "<option value=auto" + selected(settings.mode === "auto") + ">自动（按测速）</option>"
       + "<option value=mainland" + selected(settings.mode === "mainland") + ">大陆 CDN</option>"
       + "<option value=overseas" + selected(settings.mode === "overseas") + ">海外 CDN</option>"
       + "<option value=custom" + selected(settings.mode === "custom") + ">自定义</option></select></label>"
-      + "<label class=row style=\"display:block\"><span>自定义节点<small>每行一个主机名，只在自定义模式下生效；留空时按大陆 CDN。当前模式会用到：" + escapeHtml(hosts.join("、")) + "</small></span><textarea name=customHosts placeholder=\"upos-sz-mirrorali.bilivideo.com\">" + escapeHtml(settings.customHosts.join("\n")) + "</textarea></label>"
+      + "<label class=row style=\"display:block\"><span>自定义节点<small>每行一个主机名，只在自定义模式下生效；留空时按大陆 CDN。当前模式的候选：" + escapeHtml(hosts.join("、")) + "</small></span><textarea name=customHosts placeholder=\"upos-sz-mirrorali.bilivideo.com\">" + escapeHtml(settings.customHosts.join("\n")) + "</textarea></label>"
       + "<label class=row><span>并发线程<small>一个分片最多拆成几块同时下载</small></span><select name=threads>"
       + core.THREAD_OPTIONS.map(function (option) { return "<option value=" + option + selected(settings.threads === option) + ">" + option + "</option>"; }).join("")
       + "</select></label>"

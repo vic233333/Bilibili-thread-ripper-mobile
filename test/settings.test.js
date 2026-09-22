@@ -19,7 +19,7 @@ test("设置页能打开，显示版本和默认设置", async () => {
   assert.match(value.response.headers["Content-Type"], /text\/html/);
   assert.ok(value.response.body.includes(pkg.version));
   assert.ok(value.response.body.includes("已启用"));
-  assert.ok(value.response.body.includes("<option value=mainland selected>"));
+  assert.ok(value.response.body.includes("<option value=auto selected>"));
   assert.ok(value.response.body.includes("upos-sz-mirrorali.bilivideo.com"));
   assert.equal(env.store.json("btr.stats"), null, "设置页自己不算进统计");
 });
@@ -32,7 +32,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
   assert.ok(value.response.body.includes("设置已保存"));
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
-    revision: 2,
+    revision: 3,
     enabled: true,
     accelerate: "split",
     mode: "custom",
@@ -55,7 +55,7 @@ test("越界的值会被拉回范围，缺失的复选框当作关闭", async ()
   await env.run(page("/save?mode=nonsense&threads=999&maxMiB=999&minChunkKiB=1&attemptTimeoutSec=0&deadlineSec=1000"));
   const saved = env.store.json("btr.settings");
   assert.equal(saved.enabled, false);
-  assert.equal(saved.mode, "mainland");
+  assert.equal(saved.mode, "auto");
   assert.equal(saved.threads, 8);
   assert.equal(saved.maxMiB, 24);
   assert.equal(saved.minChunkKiB, 64);
@@ -79,6 +79,17 @@ test("第 1 版设置里保存的旧默认值 256 KiB 让位给新默认值，�
   assert.equal(diag.settings.minChunkKiB, 256);
   assert.equal(BTR.core.normalizeSettings({}).minChunkKiB, 128);
   assert.equal(BTR.core.normalizeSettings({}).attemptTimeoutSec, 6);
+  // 第 3 版：旧版本保存的“大陆”让位给“自动”；第 3 版自己保存的“大陆”保留。
+  const oldMainland = createStore();
+  oldMainland.setJson("btr.settings", { revision: 2, mode: "mainland" });
+  env = createEnv({ server: null, store: oldMainland });
+  diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.mode, "auto");
+  const chosenMainland = createStore();
+  chosenMainland.setJson("btr.settings", { revision: 3, mode: "mainland" });
+  env = createEnv({ server: null, store: chosenMainland });
+  diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.mode, "mainland");
 });
 
 test("重置统计、节点记忆和环境标记", async () => {
@@ -220,6 +231,7 @@ test("同一段还在拆的时候再来一份，只换节点不再拆；拆完�
   await server.start();
   try {
     const store = createStore();
+    store.setJson("btr.settings", { revision: 3, mode: "mainland" });
     const env = createEnv({ server, store });
     // 先人为登记一段“正在拆”。
     store.setJson("btr.inflight", { ["/upgcxcode/12/34/123456/123456-1-30080.m4s#0-1048575"]: Date.now() });
@@ -349,7 +361,12 @@ test("core 里的解析规则", async () => {
   assert.equal(core.mediaKind("/upgcxcode/1/2/3/3-1-100026.m4s"), "video");
   assert.equal(core.mediaKind("/foo.m4s"), "unknown");
 
-  const mainland = core.normalizeSettings({});
+  const auto = core.normalizeSettings({});
+  assert.equal(auto.mode, "auto");
+  assert.deepEqual(core.candidateHosts("upos-hz-mirrorakam.akamaized.net", auto), ["upos-hz-mirrorakam.akamaized.net", ...core.OVERSEAS_HOSTS, ...core.MAINLAND_HOSTS]);
+  assert.deepEqual(core.candidateHosts("upos-sz-mirrorcosov.bilivideo.com", auto)[0], "upos-sz-mirrorcosov.bilivideo.com");
+  assert.equal(core.candidateHosts("upos-sz-mirrorcosov.bilivideo.com", auto).length, core.OVERSEAS_HOSTS.length + core.MAINLAND_HOSTS.length, "原节点已在列表里时不重复");
+  const mainland = core.normalizeSettings({ mode: "mainland" });
   assert.deepEqual(core.candidateHosts("upos-hz-mirrorakam.akamaized.net", mainland), [...core.MAINLAND_HOSTS]);
   assert.deepEqual(core.candidateHosts("upos-sz-mirrorcos.bilivideo.com", mainland)[0], "upos-sz-mirrorcos.bilivideo.com");
   const overseas = core.normalizeSettings({ mode: "overseas" });
@@ -379,29 +396,31 @@ test("节点排序：热身时撒到所有节点，测过速度后按快慢并�
   assert.deepEqual(allBlocked.pool, ["b.bilivideo.com", "a.bilivideo.com"], "全在退避时先试最早解禁的");
 });
 
-test("按速度分块：快的多拿，太慢的不拿，没测过的拿一两块去试；热身时轮着撒", async () => {
+test("分块只用接近最快节点的那几个，等分；没测过的每段最多一块去试；热身时轮着撒；过期的速度仍作先验", async () => {
   const BTR = await loadModules();
   const { assignPieces } = BTR.accelerator;
   const now = Date.now();
-  const pool = ["fast.bilivideo.com", "mid.bilivideo.com", "slow.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com"];
+  const pool = ["fast.bilivideo.com", "near.bilivideo.com", "half.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com"];
   const health = { hosts: {
-    "fast.bilivideo.com": { bps: 160000, measuredAt: now },
-    "mid.bilivideo.com": { bps: 80000, measuredAt: now },
-    "slow.bilivideo.com": { bps: 40000, measuredAt: now },
-    "crawl.bilivideo.com": { bps: 10000, measuredAt: now }
+    "fast.bilivideo.com": { bps: 320000, measuredAt: now },
+    "near.bilivideo.com": { bps: 260000, measuredAt: now },
+    "half.bilivideo.com": { bps: 150000, measuredAt: now },
+    "crawl.bilivideo.com": { bps: 40000, measuredAt: now }
   } };
-  const assignment = assignPieces(pool, health, 12);
-  assert.equal(assignment.length, 12);
+  const assignment = assignPieces(pool, health, 8);
   const count = (host) => assignment.filter((item) => item === host).length;
-  assert.ok(count("fast.bilivideo.com") > count("mid.bilivideo.com") && count("mid.bilivideo.com") > count("slow.bilivideo.com"), assignment.join(","));
-  assert.equal(count("crawl.bilivideo.com"), 0, "不到最快节点八分之一的不拿");
-  assert.equal(count("new.bilivideo.com"), 1, "没测过的节点各拿一块去试，总数不超过四分之一");
-  assert.notEqual(assignment[0], assignment[1], "同一节点的块不挤在一起");
-  const warm = assignPieces(pool, { hosts: {} }, 8);
-  assert.deepEqual(warm, ["fast.bilivideo.com", "mid.bilivideo.com", "slow.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com", "fast.bilivideo.com", "mid.bilivideo.com", "slow.bilivideo.com"]);
-  const twoOnly = assignPieces(["a.bilivideo.com", "b.bilivideo.com"], { hosts: { "a.bilivideo.com": { bps: 100, measuredAt: now }, "b.bilivideo.com": { bps: 1, measuredAt: now } } }, 4);
-  assert.equal(twoOnly.length, 4);
-  assert.ok(twoOnly.includes("b.bilivideo.com"), "只剩两个可用时不排除慢的那个");
+  assert.equal(assignment.length, 8);
+  assert.equal(count("fast.bilivideo.com"), 4);
+  assert.equal(count("near.bilivideo.com"), 3, "不低于最快六成的节点一起等分");
+  assert.equal(count("half.bilivideo.com"), 0, "不到六成的不拿，等长的块会被它拖尾");
+  assert.equal(count("crawl.bilivideo.com"), 0);
+  assert.equal(count("new.bilivideo.com"), 1, "没测过的拿一块去试");
+  assert.equal(assignPieces(pool, health, 2).filter((item) => item === "new.bilivideo.com").length, 0, "块太少时不试新节点");
+  // 速度数据过期了也照样按它排，只是不算新鲜。
+  const stale = { hosts: { "fast.bilivideo.com": { bps: 320000, measuredAt: now - 3600000 }, "near.bilivideo.com": { bps: 100000, measuredAt: now - 3600000 } } };
+  assert.deepEqual(assignPieces(["fast.bilivideo.com", "near.bilivideo.com"], stale, 4), ["fast.bilivideo.com", "fast.bilivideo.com", "fast.bilivideo.com", "fast.bilivideo.com"]);
+  const warm = assignPieces(pool, { hosts: {} }, 7);
+  assert.deepEqual(warm, ["fast.bilivideo.com", "near.bilivideo.com", "half.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com", "fast.bilivideo.com", "near.bilivideo.com"]);
 });
 
 test("构建产物带有原作署名，且与 package.json 版本一致", () => {

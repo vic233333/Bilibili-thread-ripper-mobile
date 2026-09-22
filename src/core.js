@@ -142,7 +142,9 @@
       enabled: source.enabled !== false,
       // "split" 拆分并发下载；"swap" 只把请求换到当前模式的节点，单连接。真机上排错时用。
       accelerate: source.accelerate === "swap" ? "swap" : "split",
-      mode: source.mode === "overseas" || source.mode === "custom" ? source.mode : "mainland",
+      // "auto"：候选节点是 App 原本给的节点加上全部大陆与海外节点，按测得的速度自动挑；
+      // 其余三种与浏览器版相同。真机上哪组节点快因网络而异，所以默认交给测速决定。
+      mode: ["mainland", "overseas", "custom"].indexOf(source.mode) >= 0 ? source.mode : "auto",
       customHosts,
       threads: THREAD_OPTIONS.indexOf(threads) >= 0 ? threads : 8,
       // 一次请求超过这个大小就不拆分了：整段要先在内存里拼好才能交给播放器。
@@ -164,17 +166,19 @@
 
   function hostsForMode(settings) {
     if (settings.mode === "custom" && settings.customHosts.length) return settings.customHosts.slice();
+    if (settings.mode === "auto") return OVERSEAS_HOSTS.concat(MAINLAND_HOSTS);
     return (settings.mode === "overseas" ? OVERSEAS_HOSTS : MAINLAND_HOSTS).slice();
   }
 
   // 一个分片可以向哪些节点要。规则同上游：当前模式的节点列表，加上 B 站原本给的节点
-  // （只在它属于当前模式时保留；海外模式保留 akamai 原地址）。
+  // （只在它属于当前模式时保留；海外模式保留 akamai 原地址；自动模式总是保留）。
   function candidateHosts(originalHost, settings) {
     const original = String(originalHost || "").toLowerCase();
     const hosts = hostsForMode(settings);
     const custom = settings.mode === "custom" ? settings.customHosts : [];
     let keepOriginal;
     if (custom.length) keepOriginal = custom.indexOf(original) >= 0;
+    else if (settings.mode === "auto") keepOriginal = true;
     else if (settings.mode === "overseas") keepOriginal = MAINLAND_HOSTS.indexOf(original) < 0;
     else keepOriginal = MAINLAND_HOSTS.indexOf(original) >= 0;
     const list = keepOriginal ? [original].concat(hosts) : hosts;

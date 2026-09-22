@@ -18,8 +18,18 @@ async function runWith(request, settings) {
   return { env, value: result.value, stats: env.store.json("btr.stats") };
 }
 
-test("没有 Range 头：默认改走大陆节点（只换节点，不拆分）", async () => {
-  const { value, stats } = await runWith(mediaRequest({ noRange: true }));
+test("自动模式且没有测速数据时，不拆分的请求原样放过；有数据后改走最快的节点", async () => {
+  const noData = await runWith(mediaRequest({ noRange: true }));
+  assert.deepEqual(noData.value, {}, "不知道谁快就别乱换");
+  const store = createStore();
+  store.setJson("btr.health", { hosts: { "upos-sz-mirrorcosov.bilivideo.com": { bps: 320000, measuredAt: Date.now() }, "upos-sz-mirrorali.bilivideo.com": { bps: 200000, measuredAt: Date.now() } } });
+  const env = createEnv({ server, store });
+  const { value } = await env.run(mediaRequest({ noRange: true }));
+  assert.equal(new URL(value.url).host, "upos-sz-mirrorcosov.bilivideo.com");
+});
+
+test("大陆模式下没有 Range 头：改走大陆节点（只换节点，不拆分）", async () => {
+  const { value, stats } = await runWith(mediaRequest({ noRange: true }), { revision: 3, mode: "mainland" });
   assert.ok(value.url, "应当返回改写后的地址");
   const host = new URL(value.url).host;
   assert.ok(/^upos-sz-.*\.bilivideo\.com$/.test(host), host);
@@ -58,7 +68,7 @@ test("比两块还小的区间不拆分", async () => {
 });
 
 test("加速方式设为“只换节点”时，有界 Range 也不拆分，只改地址", async () => {
-  const { value, stats } = await runWith(mediaRequest(), { accelerate: "swap" });
+  const { value, stats } = await runWith(mediaRequest(), { revision: 3, mode: "mainland", accelerate: "swap" });
   assert.ok(value.url, "应当改写地址");
   assert.ok(/^upos-sz-.*\.bilivideo\.com$/.test(new URL(value.url).host));
   assert.equal(server.requests.length, 0);

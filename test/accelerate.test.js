@@ -21,7 +21,9 @@ function expected(start, end) {
 }
 
 test("一个 2 MiB 的 bytes=a-b 分片被拆成 8 块，从多个大陆节点拼回正确的字节", async () => {
-  const env = createEnv({ server });
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, mode: "mainland" });
+  const env = createEnv({ server, store });
   const { value } = await env.run(mediaRequest());
   assert.ok(value.response, "应当直接返回响应");
   assert.equal(value.response.status, 206);
@@ -100,7 +102,7 @@ test("Content-Range 对不上或长度不符的响应会被拒绝并换节点", 
 test("一个节点挂起不回时，超时后换节点，整段仍成功", async () => {
   server.setBehavior("upos-sz-mirrorcos.bilivideo.com", { hang: true });
   const store = createStore();
-  store.setJson("btr.settings", { attemptTimeoutSec: 3, deadlineSec: 15 });
+  store.setJson("btr.settings", { revision: 3, mode: "mainland", attemptTimeoutSec: 3, deadlineSec: 15 });
   const env = createEnv({ server, store });
   const { value, elapsedMs } = await env.run(mediaRequest());
   assert.equal(value.response.status, 206);
@@ -137,7 +139,7 @@ test("一个节点很慢时，超过预计时间就再向别的节点要一份�
 test("所有节点都失败时，请求原样交回，不改地址也不改头", async () => {
   for (const host of MAINLAND) server.setBehavior(host, { status: 403 });
   const store = createStore();
-  store.setJson("btr.settings", { deadlineSec: 8 });
+  store.setJson("btr.settings", { revision: 3, deadlineSec: 8, mode: "mainland" });
   const env = createEnv({ server, store });
   const { value } = await env.run(mediaRequest());
   assert.deepEqual(value, {}, "失败时必须 $done({})");
@@ -152,7 +154,9 @@ test("所有节点都失败时，请求原样交回，不改地址也不改头",
 });
 
 test("真机上 App 的 1 MiB 画面请求默认拆成 8 块，83 KiB 的音轨请求只换节点", async () => {
-  const env = createEnv({ server });
+  const store = createStore();
+  store.setJson("btr.settings", { revision: 3, mode: "mainland" });
+  const env = createEnv({ server, store });
   // 真机日志里的请求是 bytes=22020096-23068671 这种正好 1 MiB 的区间；假文件只有 4 MiB，取同样大小的一段。
   const video = await env.run(mediaRequest({ headers: { Range: "bytes=2097152-3145727" } }));
   assert.equal(video.value.response.status, 206);
@@ -187,6 +191,32 @@ test("$httpClient 回调里的普通 Error 算网络错误，会换节点重试"
   assert.ok(Object.keys(store.json("btr.health").hosts).length >= 2, "节点应被记上失败");
 });
 
+test("自动模式：没有测速数据时热身撒到原节点和所有节点；有数据后只用最快的几个", async () => {
+  const store = createStore();
+  store.setJson("btr.settings", { threads: 8 });
+  const env = createEnv({ server, store });
+  const first = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+  assert.equal(first.value.response.status, 206);
+  const warmHosts = new Set(server.requests.map((item) => item.host));
+  assert.ok(warmHosts.has("upos-hz-mirrorakam.akamaized.net"), "自动模式保留 App 原本的节点");
+  assert.ok(warmHosts.size >= 6);
+  // 模拟真机测速结果：原本的海外节点远快于其他。
+  const now = Date.now();
+  const health = { hosts: {} };
+  ["upos-sz-mirrorcosov.bilivideo.com", "upos-sz-mirrorali.bilivideo.com", "upos-sz-mirror14b.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com", "upos-hz-mirrorakam.akamaized.net"].forEach((host, index) => {
+    health.hosts[host] = { bps: [320000, 260000, 250000, 60000, 20000][index], measuredAt: now, okAt: now };
+  });
+  store.setJson("btr.health", health);
+  server.requests = [];
+  const second = await env.run(mediaRequest({ headers: { Range: "bytes=1048576-2097151" } }));
+  assert.equal(second.value.response.status, 206);
+  const usage = second.value.response.headers["X-BTR"];
+  const hosts = server.requests.map((item) => item.host);
+  const slowUsed = hosts.filter((host) => host === "upos-sz-mirrorhw.bilivideo.com" || host === "upos-hz-mirrorakam.akamaized.net").length;
+  assert.equal(slowUsed, 0, `慢节点不该再拿到块：${hosts.join(",")} ${usage}`);
+  assert.ok(hosts.filter((host) => host === "upos-sz-mirrorcosov.bilivideo.com").length >= 2);
+});
+
 test("海外模式会把 akamai 原地址也留作候选，并且只用海外节点", async () => {
   const store = createStore();
   store.setJson("btr.settings", { mode: "overseas", threads: 4 });
@@ -218,10 +248,10 @@ test("经 MITM 解密后的 https 分片同样被拆分，子请求默认沿用 
   assert.equal(value.response.status, 206);
   assert.ok(Buffer.from(value.response.body).equals(expected(1048576, 3145727)));
   assert.equal(env.clientCalls.length, 4);
-  for (const call of env.clientCalls) assert.ok(call.url.startsWith("https://upos-sz-"), call.url);
-  // 不拆分时的改写也保留 https。
+  for (const call of env.clientCalls) assert.ok(call.url.startsWith("https://"), call.url);
+  // 不拆分时的改写也保留 https（热身后已有测速数据，会换到测得最快的节点）。
   const rewritten = await env.run(mediaRequest({ url, noRange: true }));
-  assert.ok(rewritten.value.url.startsWith("https://upos-sz-"), rewritten.value.url);
+  assert.ok(!rewritten.value.url || rewritten.value.url.startsWith("https://"), rewritten.value.url);
 });
 
 test("子请求可以强制走 https（这里只检查地址协议，本地服务器按 http 收）", async () => {

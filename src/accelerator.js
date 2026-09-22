@@ -8,8 +8,11 @@
   const env = BTR.env;
 
   const HEALTH_KEY = "btr.health";
-  // 测过的速度只算这么久；之后这个节点回到“没测过”的那一组，重新给它机会。
-  const MEASURE_TTL_MS = 90 * 1000;
+  // 测过的速度算“新鲜”的时限：新鲜的节点按速度排进节点池；过了时限的仍保留速度作为先验
+  // （分块时照样按它排），只是排队时让位给新鲜的。每块下载都会刷新速度，所以自我修正得很快。
+  const MEASURE_TTL_MS = 10 * 60 * 1000;
+  // 4xx 是节点明确拒绝了这个地址（比如 akamai 对脚本的子请求返回 403），短时间内重试没有意义。
+  const REFUSED_BLOCK_MS = 5 * 60 * 1000;
   // 只有传够这么多字节的一块才拿来算速度，尾巴太短的会误判。
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
   const RETRY_ROUNDS = 2;
@@ -58,6 +61,8 @@
     record.fails = (record.fails || 0) + 1;
     // 3、6、12、24、48 秒，最多 60 秒。上游对“一个字节都没给”的节点也是这么退避的。
     record.blockedUntil = now + Math.min(60 * 1000, 3000 * Math.pow(2, Math.min(record.fails, 4)));
+    const status = Number(error && error.status) || 0;
+    if (status >= 400 && status < 500 && status !== 408 && status !== 429) record.blockedUntil = now + REFUSED_BLOCK_MS;
     record.failAt = now;
     record.lastError = env.safeString(error).slice(0, 100);
   }
@@ -94,55 +99,29 @@
     };
   }
 
-  // 每块先发给哪个节点。测过速度的节点按速度分份额：快的多拿，不到最快节点八分之一的不拿
-  // （只要还剩两个可用的）；没测过的节点每段最多拿四分之一的块去试。测过的不到两个时还在热身，
-  // 轮着撒。移植自上游“最快的节点拿最多的块”的思路。
+  // 每块先发给哪个节点。块是等长的，一段什么时候拼完由最慢的那块决定，所以不按速度分份额，
+  // 而是只用速度接近最快节点（不低于它六成）的那几个，块在它们之间轮流分。真机上单个节点
+  // 开八路每路速度几乎不变，所以把所有块都压给最快的一两个节点是合算的。
+  // 有测速数据（不论新鲜与否）的节点按速度排；一个字节都没测过的节点每段最多拿一块去试。
+  // 有速度数据的不到两个时还在热身，轮着撒。
+  const USABLE_RATIO = 0.6;
   function assignPieces(pool, health, count) {
-    const now = Date.now();
     const entries = pool.map(function (host) { return { host, record: health.hosts[host] || null }; });
-    const measured = entries.filter(function (entry) { return isMeasured(entry.record, now); })
-      .sort(function (a, b) { return (b.record.bps || 0) - (a.record.bps || 0); });
-    const fresh = entries.filter(function (entry) { return !isMeasured(entry.record, now); });
+    const known = entries.filter(function (entry) { return entry.record && entry.record.bps > 0; })
+      .sort(function (a, b) { return b.record.bps - a.record.bps; });
+    const unknown = entries.filter(function (entry) { return !(entry.record && entry.record.bps > 0); });
     const assignment = [];
-    if (measured.length < 2 || !pool.length) {
+    if (known.length < 2 || !pool.length) {
       for (let index = 0; index < count; index += 1) assignment.push(pool[index % pool.length]);
       return assignment;
     }
-    const best = measured[0].record.bps;
-    let usable = measured.filter(function (entry) { return entry.record.bps >= best / 8; });
-    if (usable.length < 2) usable = measured.slice(0, 2);
-    const trials = Math.min(fresh.length, Math.floor(count / 4));
-    const shares = Math.max(usable.length, count - trials);
-    const total = usable.reduce(function (sum, entry) { return sum + entry.record.bps; }, 0);
-    // 按速度分份额，先取整，再把余下的按小数部分从大到小补上；每个可用节点至少一块。
-    const quota = usable.map(function (entry) {
-      const exact = shares * entry.record.bps / total;
-      return { entry, whole: Math.max(1, Math.floor(exact)), fraction: exact - Math.floor(exact) };
-    });
-    let assigned = quota.reduce(function (sum, item) { return sum + item.whole; }, 0);
-    quota.sort(function (a, b) { return b.fraction - a.fraction; });
-    for (let index = 0; assigned < shares; index = (index + 1) % quota.length) { quota[index].whole += 1; assigned += 1; }
-    while (assigned > shares) {
-      const victim = quota.slice().sort(function (a, b) { return a.entry.record.bps - b.entry.record.bps; }).find(function (item) { return item.whole > 1; });
-      if (!victim) break;
-      victim.whole -= 1;
-      assigned -= 1;
-    }
-    // 交错发出：每一轮从份额最多的节点开始各拿一块，同一节点的块不会挤在一起。
-    const remaining = quota.slice().sort(function (a, b) { return b.whole - a.whole; });
-    while (assignment.length < shares) {
-      let progressed = false;
-      for (let index = 0; index < remaining.length && assignment.length < shares; index += 1) {
-        if (remaining[index].whole > 0) {
-          assignment.push(remaining[index].entry.host);
-          remaining[index].whole -= 1;
-          progressed = true;
-        }
-      }
-      if (!progressed) break;
-    }
-    for (let index = 0; index < trials && assignment.length < count; index += 1) assignment.push(fresh[index].host);
-    while (assignment.length < count) assignment.push(usable[assignment.length % usable.length].host);
+    const best = known[0].record.bps;
+    let usable = known.filter(function (entry) { return entry.record.bps >= best * USABLE_RATIO; });
+    if (!usable.length) usable = known.slice(0, 1);
+    const trials = unknown.length && count >= 4 ? 1 : 0;
+    const shares = count - trials;
+    for (let index = 0; index < shares; index += 1) assignment.push(usable[index % usable.length].host);
+    if (trials) assignment.push(unknown[0].host);
     return assignment.slice(0, count);
   }
 

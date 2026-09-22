@@ -11,10 +11,10 @@
 
 [Script]
 # 所有 B 站视频 CDN 主机的明文请求都交给脚本：能整体换节点的 /upgcxcode/ 分片才会被拆分，其余（PCDN 等）只记入设置页的统计，原样放过。
-btr-media = type=http-request, pattern=^http:\/\/[^\/]+\.(bilivideo\.(com|cn|net)|akamaized\.net|szbdyd\.com)(:\d+)?\/, argument=mode=http, requires-body=0, timeout=45, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=media&v=0.1.10
+btr-media = type=http-request, pattern=^http:\/\/[^\/]+\.(bilivideo\.(com|cn|net)|akamaized\.net|szbdyd\.com)(:\d+)?\/, argument=mode=http, requires-body=0, timeout=45, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=media&v=0.2.0
 
 # 设置页与统计：在 Safari 里打开 http://btr.settings/
-btr-settings = type=http-request, pattern=^http:\/\/btr\.settings(?:\/.*)?$, argument=mode=http, requires-body=0, timeout=10, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=settings&v=0.1.10
+btr-settings = type=http-request, pattern=^http:\/\/btr\.settings(?:\/.*)?$, argument=mode=http, requires-body=0, timeout=10, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js?role=settings&v=0.2.0
 
 [Host]
 # btr.settings 不是真实域名。它要解析到一个会进入 Shadowrocket 隧道的地址，请求才会在发出前

@@ -12,6 +12,7 @@ test.beforeEach(() => { server.behaviors = {}; server.requests = []; });
 
 test("环境把二进制当文本返回时：改为只换节点，记下标记，只通知一次，之后不再尝试下载", async () => {
   const store = createStore();
+  store.setJson("btr.settings", { revision: 3, mode: "mainland" });
   const env = createEnv({ server, store, binaryMode: false });
   const first = await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
   assert.ok(first.value.url, "退化为只换节点");

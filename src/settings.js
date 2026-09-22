@@ -28,12 +28,15 @@
   }
 
   // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
-  const SETTINGS_REVISION = 2;
+  const SETTINGS_REVISION = 3;
 
   function loadSettings() {
     const raw = loadRawSettings();
+    const revision = Number(raw.revision) || 1;
     // 第 2 版：每块最小从 256 KiB 改成 128 KiB。第 1 版保存的 256 是当时的默认值，不是用户的选择。
-    if ((Number(raw.revision) || 1) < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
+    if (revision < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
+    // 第 3 版：默认 CDN 模式从大陆改成自动。之前保存的“大陆”是当时的默认值。
+    if (revision < 3 && raw.mode === "mainland") delete raw.mode;
     return core.normalizeSettings(raw);
   }
 
@@ -386,11 +389,12 @@
       + "<label class=row><span>加速方式<small>多线程出问题时先退回“只换节点”排查</small></span><select name=accelerate>"
       + "<option value=split" + selected(settings.accelerate === "split") + ">多线程拆分</option>"
       + "<option value=swap" + selected(settings.accelerate === "swap") + ">只换节点</option></select></label>"
-      + "<label class=row><span>CDN 模式<small>海外看冷门视频一般选大陆 CDN</small></span><select name=mode>"
+      + "<label class=row><span>CDN 模式<small>自动：App 原本的节点加全部大陆、海外节点一起测速，只用最快的几个。哪组快因网络而异，先跑一次节点测速</small></span><select name=mode>"
+      + "<option value=auto" + selected(settings.mode === "auto") + ">自动（按测速）</option>"
       + "<option value=mainland" + selected(settings.mode === "mainland") + ">大陆 CDN</option>"
       + "<option value=overseas" + selected(settings.mode === "overseas") + ">海外 CDN</option>"
       + "<option value=custom" + selected(settings.mode === "custom") + ">自定义</option></select></label>"
-      + "<label class=row style=\"display:block\"><span>自定义节点<small>每行一个主机名，只在自定义模式下生效；留空时按大陆 CDN。当前模式会用到：" + escapeHtml(hosts.join("、")) + "</small></span><textarea name=customHosts placeholder=\"upos-sz-mirrorali.bilivideo.com\">" + escapeHtml(settings.customHosts.join("\n")) + "</textarea></label>"
+      + "<label class=row style=\"display:block\"><span>自定义节点<small>每行一个主机名，只在自定义模式下生效；留空时按大陆 CDN。当前模式的候选：" + escapeHtml(hosts.join("、")) + "</small></span><textarea name=customHosts placeholder=\"upos-sz-mirrorali.bilivideo.com\">" + escapeHtml(settings.customHosts.join("\n")) + "</textarea></label>"
       + "<label class=row><span>并发线程<small>一个分片最多拆成几块同时下载</small></span><select name=threads>"
       + core.THREAD_OPTIONS.map(function (option) { return "<option value=" + option + selected(settings.threads === option) + ">" + option + "</option>"; }).join("")
       + "</select></label>"
