@@ -152,7 +152,7 @@
       swapSingle: source.swapSingle !== false,
       // 子请求沿用原地址的协议（App 是明文 http），也可以强制走 https。
       subrequestScheme: source.subrequestScheme === "https" ? "https" : "keep",
-      attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 8)),
+      attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 6)),
       deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 20)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },

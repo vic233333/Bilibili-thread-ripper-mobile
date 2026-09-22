@@ -19,12 +19,19 @@
     return env.store.readJson(SETTINGS_KEY, {});
   }
 
+  // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
+  const SETTINGS_REVISION = 2;
+
   function loadSettings() {
-    return core.normalizeSettings(loadRawSettings());
+    const raw = loadRawSettings();
+    // 第 2 版：每块最小从 256 KiB 改成 128 KiB。第 1 版保存的 256 是当时的默认值，不是用户的选择。
+    if ((Number(raw.revision) || 1) < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
+    return core.normalizeSettings(raw);
   }
 
   function saveSettings(settings) {
     const plain = {
+      revision: SETTINGS_REVISION,
       enabled: settings.enabled,
       accelerate: settings.accelerate,
       mode: settings.mode,

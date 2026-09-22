@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.3
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.4
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.3" };
+const BTR = { VERSION: "0.1.4" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -168,7 +168,7 @@ const BTR = { VERSION: "0.1.3" };
       swapSingle: source.swapSingle !== false,
       // 子请求沿用原地址的协议（App 是明文 http），也可以强制走 https。
       subrequestScheme: source.subrequestScheme === "https" ? "https" : "keep",
-      attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 8)),
+      attemptTimeoutSec: Math.round(clamp(source.attemptTimeoutSec, 3, 30, 6)),
       deadlineSec: Math.round(clamp(source.deadlineSec, 5, 40, 20)),
       debug: source.debug === true,
       get maxBytes() { return this.maxMiB * 1024 * 1024; },
@@ -592,46 +592,109 @@ const BTR = { VERSION: "0.1.3" };
     return list.slice(shift).concat(list.slice(0, shift));
   }
 
-  async function downloadPiece(piece, plan) {
+  // 一块该多久传完：按已测到的最快节点估，超过它的 1.5 倍还没回来就再向另一个节点要一份
+  // 副本，先到先用。上游叫这个 hedge。没有测速数据时用固定值。
+  function hedgeDelayMs(plan, piece) {
+    const now = Date.now();
+    let best = 0;
+    Object.keys(plan.health.hosts).forEach(function (host) {
+      const record = plan.health.hosts[host];
+      if (isMeasured(record, now) && record.bps > best) best = record.bps;
+    });
+    if (!best) return 1200;
+    return Math.max(400, Math.min(2500, Math.round(piece.length / best * 1000 * 1.5)));
+  }
+
+  // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
+  // $httpClient 没法取消，输掉的副本会在后台跑完，它的结果只用来更新节点速度。
+  function downloadPiece(piece, plan) {
     const order = rotate(plan.pool, piece.index);
     plan.all.forEach(function (host) { if (order.indexOf(host) < 0) order.push(host); });
-    let lastError = null;
-    for (let round = 0; round < RETRY_ROUNDS; round += 1) {
-      for (let index = 0; index < order.length; index += 1) {
+    const queue = [];
+    for (let round = 0; round < RETRY_ROUNDS; round += 1) order.forEach(function (host) { queue.push({ host, round }); });
+    return new Promise(function (resolve, reject) {
+      let settled = false;
+      let running = 0;
+      let cursor = 0;
+      let timer = null;
+      let lastError = null;
+      function clearHedge() {
+        if (timer !== null && env.api.clearTimeout) env.api.clearTimeout(timer);
+        timer = null;
+      }
+      function finish(ok, value) {
+        if (settled) return;
+        settled = true;
+        clearHedge();
+        if (ok) resolve(value);
+        else reject(value);
+      }
+      function nextHost() {
+        const now = Date.now();
+        while (cursor < queue.length) {
+          const item = queue[cursor++];
+          // 第一轮跳过还在退避的节点，除非全都在退避。
+          if (item.round === 0 && isBlocked(plan.health.hosts[item.host], now)
+            && queue.some(function (other) { return other.round === 0 && !isBlocked(plan.health.hosts[other.host], now); })) continue;
+          return item.host;
+        }
+        return null;
+      }
+      function giveUp(error) {
+        if (running > 0) return;
+        finish(false, error);
+      }
+      function launch(isHedge) {
+        if (settled) return;
         // 别的块已经宣告失败、整段要交回原连接时，这块也不用再换节点试了。
-        if (plan.aborted) throw lastError || env.makeError("Aborted", "整段下载已放弃");
+        if (plan.aborted) { finish(false, lastError || env.makeError("Aborted", "整段下载已放弃")); return; }
+        const now = Date.now();
+        const remainingSec = (plan.deadlineAt - now) / 1000;
+        if (remainingSec < 1) { giveUp(lastError || env.makeError("Deadline", "这次请求的总时限已到")); return; }
         // 整段的重试预算：平均每块三次。所有节点都拒绝同一个地址时，不必让每块把每个节点都
         // 试两遍，早点交回原连接。
         if (plan.attempts >= plan.attemptBudget) {
-          plan.aborted = true;
-          throw lastError || env.makeError("Budget", "重试次数已用完");
+          if (running === 0) plan.aborted = true;
+          giveUp(lastError || env.makeError("Budget", "重试次数已用完"));
+          return;
         }
-        const host = order[index];
-        const now = Date.now();
-        const remainingSec = (plan.deadlineAt - now) / 1000;
-        if (remainingSec < 1) throw lastError || env.makeError("Deadline", "这次请求的总时限已到");
-        // 第一轮跳过还在退避的节点，除非全都在退避。
-        if (round === 0 && isBlocked(plan.health.hosts[host], now) && order.some(function (other) { return !isBlocked(plan.health.hosts[other], now); })) continue;
-        const url = core.buildUrl(plan.parts, { host, port: "", scheme: plan.scheme });
+        const host = nextHost();
+        if (!host) { giveUp(lastError || env.makeError("NoHosts", "没有可用的 CDN 节点")); return; }
+        running += 1;
         plan.attempts += 1;
-        try {
-          const result = await fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec));
+        if (isHedge) plan.hedges += 1;
+        const url = core.buildUrl(plan.parts, { host, port: "", scheme: plan.scheme });
+        fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
+          running -= 1;
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
+          if (settled) return;
           plan.usage[host] = (plan.usage[host] || 0) + 1;
           result.host = host;
-          return result;
-        } catch (error) {
+          finish(true, result);
+        }, function (error) {
+          running -= 1;
           if (!error || HOST_ERRORS.indexOf(error.name) < 0) {
             plan.aborted = true;
-            throw error || env.makeError("ScriptError", "未知错误");
+            finish(false, error || env.makeError("ScriptError", "未知错误"));
+            return;
           }
           markFailure(plan.health, host, error);
           env.log("debug", "子块 " + piece.index + " 在 " + host + " 失败", error);
           lastError = error;
-        }
+          if (!settled) launch(false);
+        });
+        scheduleHedge();
       }
-    }
-    throw lastError || env.makeError("NoHosts", "没有可用的 CDN 节点");
+      function scheduleHedge() {
+        clearHedge();
+        if (settled || !env.api.setTimeout || running >= plan.hedgeMax) return;
+        timer = env.api.setTimeout(function () {
+          timer = null;
+          if (!settled && running < plan.hedgeMax) launch(true);
+        }, hedgeDelayMs(plan, piece));
+      }
+      launch(false);
+    });
   }
 
   // context: { parts, range, headers, settings, health }
@@ -653,7 +716,10 @@ const BTR = { VERSION: "0.1.3" };
       deadlineAt: startedAt + settings.deadlineSec * 1000,
       usage: {},
       attempts: 0,
+      hedges: 0,
       attemptBudget: pieces.length * 3,
+      // 每块最多同时几份副本。脚本环境一次最多约 20 个并发请求，线程多时就不开副本。
+      hedgeMax: settings.threads <= 10 ? 2 : 1,
       aborted: false
     };
     env.log("debug", "拆成 " + pieces.length + " 块，节点池", plan.pool);
@@ -686,6 +752,7 @@ const BTR = { VERSION: "0.1.3" };
       pieces: pieces.length,
       usage: plan.usage,
       attempts: plan.attempts,
+      hedges: plan.hedges,
       elapsedMs: Math.max(1, Date.now() - startedAt)
     };
   }
@@ -724,12 +791,19 @@ const BTR = { VERSION: "0.1.3" };
     return env.store.readJson(SETTINGS_KEY, {});
   }
 
+  // 设置的版本号。默认值变了的时候，老版本保存下来的旧默认值要让位给新默认值。
+  const SETTINGS_REVISION = 2;
+
   function loadSettings() {
-    return core.normalizeSettings(loadRawSettings());
+    const raw = loadRawSettings();
+    // 第 2 版：每块最小从 256 KiB 改成 128 KiB。第 1 版保存的 256 是当时的默认值，不是用户的选择。
+    if ((Number(raw.revision) || 1) < 2 && Number(raw.minChunkKiB) === 256) delete raw.minChunkKiB;
+    return core.normalizeSettings(raw);
   }
 
   function saveSettings(settings) {
     const plain = {
+      revision: SETTINGS_REVISION,
       enabled: settings.enabled,
       accelerate: settings.accelerate,
       mode: settings.mode,
@@ -1152,6 +1226,7 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       entry.threads = download.pieces;
       entry.hosts = download.usage;
       entry.attempts = download.attempts;
+      entry.hedges = download.hedges;
       const responseHeaders = {
         "Content-Type": download.contentType || "video/mp4",
         "Content-Range": "bytes " + range.start + "-" + range.end + "/" + (download.total === null ? "*" : download.total),
@@ -1231,7 +1306,10 @@ if (typeof __BTR_EXPOSE__ === "function") __BTR_EXPOSE__(BTR);
       env.log("error", "统计保存失败", error);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
-    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", entry.hosts || entry.rewrittenTo || entry.error || "");
+    const detail = entry.hosts
+      ? JSON.stringify(entry.hosts) + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
+      : entry.rewrittenTo || entry.error || "";
+    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }
     catch (error) { env.log("error", "日志保存失败", error); }
     env.finish(outcome.done);

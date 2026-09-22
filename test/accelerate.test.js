@@ -105,9 +105,33 @@ test("一个节点挂起不回时，超时后换节点，整段仍成功", async
   const { value, elapsedMs } = await env.run(mediaRequest());
   assert.equal(value.response.status, 206);
   assert.ok(Buffer.from(value.response.body).equals(expected(1048576, 3145727)));
-  assert.ok(elapsedMs >= 2500 && elapsedMs < 12000, `耗时应约等于一次超时，实际 ${elapsedMs}ms`);
-  const health = env.store.json("btr.health");
-  assert.match(health.hosts["upos-sz-mirrorcos.bilivideo.com"].lastError, /Timeout|timed out/);
+  // 没有测速数据时副本在 1.2 秒后启动，整段不必等到 3 秒超时。
+  assert.ok(elapsedMs < 3000, `副本应在超时之前救回这块，实际 ${elapsedMs}ms`);
+  const stats = env.store.json("btr.stats");
+  assert.ok(stats.recent[0].hedges >= 1, "应当开过副本");
+  assert.ok(!stats.recent[0].hosts["upos-sz-mirrorcos.bilivideo.com"], "挂起的节点不该算作赢家");
+});
+
+test("一个节点很慢时，超过预计时间就再向别的节点要一份副本，先到先用", async () => {
+  // 先热身一次，让节点有测速数据，副本的等待时间才会按速度估算。
+  const store = createStore();
+  store.setJson("btr.settings", { threads: 4, minChunkKiB: 256 });
+  const warm = createEnv({ server, store });
+  assert.equal((await warm.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }))).value.response.status, 206);
+  const health = store.json("btr.health");
+  const measured = Object.keys(health.hosts).filter((host) => health.hosts[host].measuredAt);
+  assert.ok(measured.length >= 4, "热身应测出多个节点的速度");
+  // 让测速最快的那个节点变得极慢：它会被分到块，但副本会救回来。
+  const fastest = measured.sort((a, b) => health.hosts[b].bps - health.hosts[a].bps)[0];
+  server.setBehavior(fastest, { delayMs: 5000 });
+  const env = createEnv({ server, store });
+  const { value, elapsedMs } = await env.run(mediaRequest({ headers: { Range: "bytes=1048576-2097151" } }));
+  assert.equal(value.response.status, 206);
+  assert.ok(Buffer.from(value.response.body).equals(expected(1048576, 2097151)));
+  assert.ok(elapsedMs < 4000, `副本应在慢节点之前回来，实际 ${elapsedMs}ms`);
+  const stats = store.json("btr.stats");
+  assert.ok(stats.recent[0].hedges >= 1, "应当开过副本");
+  assert.ok(!Object.keys(stats.recent[0].hosts).includes(fastest) || stats.recent[0].hosts[fastest] < 1, "慢节点不该算作赢家");
 });
 
 test("所有节点都失败时，请求原样交回，不改地址也不改头", async () => {

@@ -71,6 +71,7 @@
       entry.threads = download.pieces;
       entry.hosts = download.usage;
       entry.attempts = download.attempts;
+      entry.hedges = download.hedges;
       const responseHeaders = {
         "Content-Type": download.contentType || "video/mp4",
         "Content-Range": "bytes " + range.start + "-" + range.end + "/" + (download.total === null ? "*" : download.total),
@@ -150,7 +151,10 @@
       env.log("error", "统计保存失败", error);
     }
     // 每个请求的去向都记一行，这是排错时最有用的信息；每块的细节只在调试日志里。
-    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", entry.hosts || entry.rewrittenTo || entry.error || "");
+    const detail = entry.hosts
+      ? JSON.stringify(entry.hosts) + (entry.hedges ? " 副本 " + entry.hedges : "") + (entry.attempts > entry.threads ? " 重试 " + (entry.attempts - entry.threads - (entry.hedges || 0)) : "")
+      : entry.rewrittenTo || entry.error || "";
+    env.log("info", outcome.result + "/" + outcome.reason + " " + entry.kind + " " + (entry.range || "") + " " + entry.elapsedMs + "ms", detail);
     try { settingsModule.appendLog(env.logLines, startedAt); }
     catch (error) { env.log("error", "日志保存失败", error); }
     env.finish(outcome.done);

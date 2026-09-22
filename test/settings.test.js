@@ -32,6 +32,7 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
   assert.ok(value.response.body.includes("设置已保存"));
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
+    revision: 2,
     enabled: true,
     accelerate: "split",
     mode: "custom",
@@ -61,6 +62,23 @@ test("越界的值会被拉回范围，缺失的复选框当作关闭", async ()
   assert.equal(saved.attemptTimeoutSec, 3);
   assert.equal(saved.deadlineSec, 40);
   assert.equal(saved.swapSingle, false);
+});
+
+test("第 1 版设置里保存的旧默认值 256 KiB 让位给新默认值，用户自己改过的值保留", async () => {
+  const BTR = await loadModules();
+  const oldDefault = createStore();
+  oldDefault.setJson("btr.settings", { minChunkKiB: 256, threads: 4 });
+  let env = createEnv({ server: null, store: oldDefault });
+  let diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.minChunkKiB, 128);
+  assert.equal(diag.settings.threads, 4);
+  const chosen = createStore();
+  chosen.setJson("btr.settings", { revision: 2, minChunkKiB: 256 });
+  env = createEnv({ server: null, store: chosen });
+  diag = JSON.parse((await env.run(page("/diag.json"))).value.response.body);
+  assert.equal(diag.settings.minChunkKiB, 256);
+  assert.equal(BTR.core.normalizeSettings({}).minChunkKiB, 128);
+  assert.equal(BTR.core.normalizeSettings({}).attemptTimeoutSec, 6);
 });
 
 test("重置统计、节点记忆和环境标记", async () => {
