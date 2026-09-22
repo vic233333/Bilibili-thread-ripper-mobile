@@ -28,8 +28,8 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
   const env = createEnv({ server: null });
   const query = "enabled=1&mode=custom&customHosts=upos-sz-mirrorcos.bilivideo.com%0Aupos-sz-mirrorali.bilivideo.com%2C+bad+host&threads=4&maxMiB=12&minChunkKiB=512&subrequestScheme=https&attemptTimeoutSec=6&deadlineSec=25&debug=1";
   const { value } = await env.run(page(`/save?${query}`));
-  assert.equal(value.response.status, 200);
-  assert.ok(value.response.body.includes("设置已保存"));
+  assert.equal(value.response.status, 302, "保存完要跳回设置页，留在 /save 上刷新会再存一次");
+  assert.equal(value.response.headers.Location, "http://btr.settings/?done=saved");
   const saved = env.store.json("btr.settings");
   assert.deepEqual(saved, {
     revision: 3,
@@ -46,8 +46,10 @@ test("保存表单后设置写进存储，页面回显新值", async () => {
     deadlineSec: 25,
     debug: true
   });
-  assert.ok(value.response.body.includes("<option value=4 selected>"));
-  assert.ok(value.response.body.includes("<option value=custom selected>"));
+  const back = (await env.run(page("/?done=saved"))).value.response.body;
+  assert.ok(back.includes("设置已保存"));
+  assert.ok(back.includes("<option value=4 selected>"));
+  assert.ok(back.includes("<option value=custom selected>"));
 });
 
 test("越界的值会被拉回范围，缺失的复选框当作关闭", async () => {
@@ -99,7 +101,9 @@ test("重置统计、节点记忆和环境标记", async () => {
   store.setJson("btr.env", { binaryUnsupported: true });
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=all"));
-  assert.ok(value.response.body.includes("已重置"));
+  assert.equal(value.response.status, 302);
+  assert.equal(value.response.headers.Location, "http://btr.settings/?done=reset&what=all");
+  assert.ok((await env.run(page("/?done=reset&what=all"))).value.response.body.includes("已重置"));
   assert.equal(store.json("btr.stats").seen, 0);
   assert.deepEqual(store.json("btr.health"), { hosts: {} });
   assert.deepEqual(store.json("btr.env"), {});
@@ -112,7 +116,7 @@ test("全部重置把设置也恢复成默认值", async () => {
   store.setJson("btr.lastMedia", { url: "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3/3-1-30080.m4s?x=1", at: Date.now() });
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=all"));
-  assert.ok(value.response.body.includes("已重置"));
+  assert.equal(value.response.status, 302);
   assert.deepEqual(store.json("btr.settings"), { revision: 3 });
   assert.deepEqual(store.json("btr.busy"), {});
   assert.deepEqual(store.json("btr.lastMedia"), {});
@@ -130,7 +134,8 @@ test("恢复默认设置只动设置，统计和节点记忆留着", async () =>
   store.setJson("btr.health", { hosts: { "upos-sz-mirrorali.bilivideo.com": { bps: 1, okAt: Date.now() } } });
   const env = createEnv({ server: null, store });
   const { value } = await env.run(page("/reset?what=settings"));
-  assert.ok(value.response.body.includes("恢复默认"));
+  assert.equal(value.response.status, 302);
+  assert.ok((await env.run(page("/?done=reset&what=settings"))).value.response.body.includes("恢复默认"));
   assert.deepEqual(store.json("btr.settings"), { revision: 3 });
   assert.equal(store.json("btr.stats").seen, 9);
   assert.ok(store.json("btr.health").hosts["upos-sz-mirrorali.bilivideo.com"]);
@@ -400,6 +405,36 @@ test("预取实验页：先交付页面，回调之后把结果写进标记", as
     assert.equal(result.delayed.state, "ok", "交出页面之后由定时器发出的那一发也该跑完");
     assert.ok(result.pendingCallback.ms >= 0, "真回调到达的时间也要记下来");
     assert.equal(result.control.bytes, 64 * 1024);
+  } finally {
+    await server.close();
+  }
+});
+
+test("重置和保存都跳回设置页：停在那个地址上反复刷新不会一再重置", async () => {
+  const { RangeServer } = require("./range-server");
+  const { mediaRequest } = require("./harness");
+  const server = new RangeServer({ size: 2 * 1024 * 1024 });
+  await server.start();
+  try {
+    const store = createStore();
+    const env = createEnv({ server, store });
+    await env.run(page("/reset?what=all"));
+    await env.run(mediaRequest({ headers: { Range: "bytes=0-1048575" } }));
+    const since = store.json("btr.stats").since;
+    assert.equal(store.json("btr.stats").seen, 1);
+
+    // 跳转的落点是设置页，刷新它多少次都只是看一眼。
+    for (let round = 0; round < 3; round += 1) {
+      const { value } = await env.run(page("/?done=reset&what=all"));
+      assert.equal(value.response.status, 200);
+    }
+    assert.equal(store.json("btr.stats").seen, 1, "看页面不该清掉统计");
+    assert.equal(store.json("btr.stats").since, since, "“统计开始于”不该每次刷新都往后走");
+    assert.equal(store.json("btr.beat").mediaN, 1);
+
+    // 全部重置刚清掉心跳，这次打开要重新记上，不然看着像存储坏了。
+    await env.run(page("/reset?what=all"));
+    assert.equal(store.json("btr.beat").pageN, 1);
   } finally {
     await server.close();
   }

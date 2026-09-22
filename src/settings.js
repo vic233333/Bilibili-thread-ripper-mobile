@@ -740,6 +740,19 @@
       + "</body></html>";
   }
 
+  // 做完事就跳回设置页。/save 和 /reset 都会改东西，留在那个地址上一刷新就再做一次：
+  // Safari 恢复标签页、下拉刷新、误点返回都算一次刷新，统计于是永远停在 0，「统计开始于」
+  // 每次都变成当下。跳转之后地址栏是 /，刷新多少次都不会再重置。
+  function redirect(path) {
+    // 绝对地址：有的客户端对相对 Location 处理得不一致。
+    const target = "http://" + SETTINGS_HOST + path;
+    return {
+      status: 302,
+      headers: { Location: target, "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      body: "<!doctype html><html lang=zh-CN><meta charset=utf-8><meta http-equiv=refresh content=\"0;url=" + escapeHtml(target) + "\"><p>已处理，正在返回设置页…… <a href=\"" + escapeHtml(target) + "\">点这里</a></p></html>"
+    };
+  }
+
   function htmlResponse(body, status) {
     return { status: status || 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }, body };
   }
@@ -755,6 +768,9 @@
     // 每打开一次页面就 +1。刷新之后这个数字不涨，就说明存储根本没在保存。
     recordBeat("page");
     let message = "";
+    if (query.done === "saved") message = "设置已保存。";
+    else if (query.done === "savefail") message = "设置保存失败：这个环境没有可用的 $persistentStore。";
+    else if (query.done === "reset") message = RESET_LABELS[query.what] ? "已重置：" + RESET_LABELS[query.what] + "。" : "没有指定要重置什么。";
     if (path === "/speedtest") return htmlResponse(renderSpeedtest(loadSettings(), loadLastMedia()));
     if (path === "/speedtest/run") return runSpeedtest(query);
     // 实验：脚本调完 $done 之后，它发出的请求还会不会跑完。会的话就能在交付这一段之后预取下一段。
@@ -763,7 +779,7 @@
     if (path === "/store/test") return htmlResponse(renderStoreTest(storeSelfTest(), loadBeat()));
     if (path === "/save") {
       const next = settingsFromQuery(query);
-      message = saveSettings(next) ? "设置已保存。" : "设置保存失败：这个环境没有可用的 $persistentStore。";
+      return redirect("/?done=" + (saveSettings(next) ? "saved" : "savefail"));
     } else if (path === "/reset") {
       const what = query.what || "";
       // “全部重置”连设置一起恢复默认，不然线程数、每块大小这些会留着上次存的值。
@@ -777,8 +793,10 @@
         env.store.writeJson(INFLIGHT_KEY, {});
         env.store.writeJson(BUSY_KEY, {});
         env.store.writeJson(BEAT_KEY, {});
+        // 心跳刚被清掉，这次打开要重新记上，不然页面显示“打开过 0 次”，看着像存储坏了。
+        recordBeat("page");
       }
-      message = RESET_LABELS[what] ? "已重置：" + RESET_LABELS[what] + "。" : "没有指定要重置什么。";
+      return redirect("/?done=reset&what=" + encodeURIComponent(what));
     } else if (path === "/diag.json") {
       return jsonResponse({
         version: BTR.VERSION,
