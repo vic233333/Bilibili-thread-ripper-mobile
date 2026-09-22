@@ -94,6 +94,58 @@
     };
   }
 
+  // 每块先发给哪个节点。测过速度的节点按速度分份额：快的多拿，不到最快节点八分之一的不拿
+  // （只要还剩两个可用的）；没测过的节点每段最多拿四分之一的块去试。测过的不到两个时还在热身，
+  // 轮着撒。移植自上游“最快的节点拿最多的块”的思路。
+  function assignPieces(pool, health, count) {
+    const now = Date.now();
+    const entries = pool.map(function (host) { return { host, record: health.hosts[host] || null }; });
+    const measured = entries.filter(function (entry) { return isMeasured(entry.record, now); })
+      .sort(function (a, b) { return (b.record.bps || 0) - (a.record.bps || 0); });
+    const fresh = entries.filter(function (entry) { return !isMeasured(entry.record, now); });
+    const assignment = [];
+    if (measured.length < 2 || !pool.length) {
+      for (let index = 0; index < count; index += 1) assignment.push(pool[index % pool.length]);
+      return assignment;
+    }
+    const best = measured[0].record.bps;
+    let usable = measured.filter(function (entry) { return entry.record.bps >= best / 8; });
+    if (usable.length < 2) usable = measured.slice(0, 2);
+    const trials = Math.min(fresh.length, Math.floor(count / 4));
+    const shares = Math.max(usable.length, count - trials);
+    const total = usable.reduce(function (sum, entry) { return sum + entry.record.bps; }, 0);
+    // 按速度分份额，先取整，再把余下的按小数部分从大到小补上；每个可用节点至少一块。
+    const quota = usable.map(function (entry) {
+      const exact = shares * entry.record.bps / total;
+      return { entry, whole: Math.max(1, Math.floor(exact)), fraction: exact - Math.floor(exact) };
+    });
+    let assigned = quota.reduce(function (sum, item) { return sum + item.whole; }, 0);
+    quota.sort(function (a, b) { return b.fraction - a.fraction; });
+    for (let index = 0; assigned < shares; index = (index + 1) % quota.length) { quota[index].whole += 1; assigned += 1; }
+    while (assigned > shares) {
+      const victim = quota.slice().sort(function (a, b) { return a.entry.record.bps - b.entry.record.bps; }).find(function (item) { return item.whole > 1; });
+      if (!victim) break;
+      victim.whole -= 1;
+      assigned -= 1;
+    }
+    // 交错发出：每一轮从份额最多的节点开始各拿一块，同一节点的块不会挤在一起。
+    const remaining = quota.slice().sort(function (a, b) { return b.whole - a.whole; });
+    while (assignment.length < shares) {
+      let progressed = false;
+      for (let index = 0; index < remaining.length && assignment.length < shares; index += 1) {
+        if (remaining[index].whole > 0) {
+          assignment.push(remaining[index].entry.host);
+          remaining[index].whole -= 1;
+          progressed = true;
+        }
+      }
+      if (!progressed) break;
+    }
+    for (let index = 0; index < trials && assignment.length < count; index += 1) assignment.push(fresh[index].host);
+    while (assignment.length < count) assignment.push(usable[assignment.length % usable.length].host);
+    return assignment.slice(0, count);
+  }
+
   async function fetchPiece(url, piece, headers, timeoutSec) {
     const startedAt = Date.now();
     const requestHeaders = {};
@@ -141,7 +193,9 @@
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
   // $httpClient 没法取消，输掉的副本会在后台跑完，它的结果只用来更新节点速度。
   function downloadPiece(piece, plan) {
-    const order = rotate(plan.pool, piece.index);
+    // 第一选择是按速度分到的节点，之后按速度顺序换别的节点；退避中的排最后。
+    const first = plan.assignment[piece.index] || plan.pool[piece.index % plan.pool.length];
+    const order = [first].concat(rotate(plan.pool, piece.index).filter(function (host) { return host !== first; }));
     plan.all.forEach(function (host) { if (order.indexOf(host) < 0) order.push(host); });
     const queue = [];
     for (let round = 0; round < RETRY_ROUNDS; round += 1) order.forEach(function (host) { queue.push({ host, round }); });
@@ -194,11 +248,13 @@
         const host = nextHost();
         if (!host) { giveUp(lastError || env.makeError("NoHosts", "没有可用的 CDN 节点")); return; }
         running += 1;
+        plan.inflight += 1;
         plan.attempts += 1;
         if (isHedge) plan.hedges += 1;
         const url = core.buildUrl(plan.parts, { host, port: "", scheme: plan.scheme });
         fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
           running -= 1;
+          plan.inflight -= 1;
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
           env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + Math.round(result.bytes.byteLength / result.elapsedMs) + "KB/s" + (settled ? "（副本落败）" : ""));
           if (settled) return;
@@ -208,6 +264,7 @@
           finish(true, result);
         }, function (error) {
           running -= 1;
+          plan.inflight -= 1;
           if (!error || HOST_ERRORS.indexOf(error.name) < 0) {
             plan.aborted = true;
             finish(false, error || env.makeError("ScriptError", "未知错误"));
@@ -225,7 +282,10 @@
         if (settled || !env.api.setTimeout || running >= plan.hedgeMax) return;
         timer = env.api.setTimeout(function () {
           timer = null;
-          if (!settled && running < plan.hedgeMax) launch(true);
+          // 整段同时在途的请求有上限，满了就不开副本，改为再等一个周期。
+          if (settled || running >= plan.hedgeMax) return;
+          if (plan.inflight >= plan.maxInflight) { scheduleHedge(); return; }
+          launch(true);
         }, hedgeDelayMs(plan, piece));
       }
       launch(false);
@@ -248,17 +308,22 @@
       health: context.health,
       pool: ordered.pool,
       all: ordered.all,
+      assignment: assignPieces(ordered.pool, context.health, pieces.length),
       deadlineAt: startedAt + settings.deadlineSec * 1000,
       usage: {},
       attempts: 0,
       hedges: 0,
       pieceMs: [],
       attemptBudget: pieces.length * 3,
-      // 每块最多同时几份副本。脚本环境一次最多约 20 个并发请求，线程多时就不开副本。
-      hedgeMax: settings.threads <= 10 ? 2 : 1,
+      // 每块最多两份副本；整段同时在途最多 16 个请求（脚本环境的上限约 20）。
+      hedgeMax: 2,
+      inflight: 0,
+      maxInflight: 16,
       aborted: false
     };
-    env.log("debug", "拆成 " + pieces.length + " 块，节点池", plan.pool);
+    const tally = {};
+    plan.assignment.forEach(function (host) { tally[host.split(".")[0]] = (tally[host.split(".")[0]] || 0) + 1; });
+    env.log("debug", "拆成 " + pieces.length + " 块，分配", tally);
     let results;
     try {
       results = await Promise.all(pieces.map(function (piece) { return downloadPiece(piece, plan); }));
@@ -314,6 +379,7 @@
 
   BTR.accelerator = Object.freeze({
     HEALTH_KEY,
+    assignPieces,
     downloadRange,
     fetchPiece,
     loadHealth,

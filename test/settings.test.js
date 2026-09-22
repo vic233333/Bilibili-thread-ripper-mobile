@@ -269,8 +269,9 @@ test("设置页带一键复制：日志和诊断 JSON 预先放在页面里，�
   const env = createEnv({ server: null, store });
   const html = (await env.run(page("/"))).value.response.body;
   assert.ok(html.includes("data-copy=log") && html.includes("data-copy=diag"));
-  assert.ok(html.includes("<textarea id=copy-log") && html.includes("accelerated/ok video 0-1 5ms"));
-  assert.ok(html.includes("<textarea id=copy-diag") && html.includes("&quot;version&quot;"));
+  assert.ok(html.includes("<textarea id=copy-log class=copybox readonly>") && html.includes("accelerated/ok video 0-1 5ms"));
+  assert.ok(html.includes("<textarea id=copy-diag class=copybox readonly>") && html.includes("&quot;version&quot;"));
+  assert.ok(html.includes("<details id=box-log"), "文本框放在可展开的区块里，复制失败时可以手动全选");
   assert.ok(html.includes("<abbr title=\"upos-sz-mirrorali.bilivideo.com\">upos-sz-mirrorali</abbr>"));
   assert.ok(html.includes("x".repeat(36) + "…"), "过长的错误信息要截断");
   assert.ok(html.includes("class=scroll"));
@@ -358,6 +359,31 @@ test("节点排序：热身时撒到所有节点，测过速度后按快慢并�
     "b.bilivideo.com": { blockedUntil: now + 1000 }
   } }, 8);
   assert.deepEqual(allBlocked.pool, ["b.bilivideo.com", "a.bilivideo.com"], "全在退避时先试最早解禁的");
+});
+
+test("按速度分块：快的多拿，太慢的不拿，没测过的拿一两块去试；热身时轮着撒", async () => {
+  const BTR = await loadModules();
+  const { assignPieces } = BTR.accelerator;
+  const now = Date.now();
+  const pool = ["fast.bilivideo.com", "mid.bilivideo.com", "slow.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com"];
+  const health = { hosts: {
+    "fast.bilivideo.com": { bps: 160000, measuredAt: now },
+    "mid.bilivideo.com": { bps: 80000, measuredAt: now },
+    "slow.bilivideo.com": { bps: 40000, measuredAt: now },
+    "crawl.bilivideo.com": { bps: 10000, measuredAt: now }
+  } };
+  const assignment = assignPieces(pool, health, 12);
+  assert.equal(assignment.length, 12);
+  const count = (host) => assignment.filter((item) => item === host).length;
+  assert.ok(count("fast.bilivideo.com") > count("mid.bilivideo.com") && count("mid.bilivideo.com") > count("slow.bilivideo.com"), assignment.join(","));
+  assert.equal(count("crawl.bilivideo.com"), 0, "不到最快节点八分之一的不拿");
+  assert.equal(count("new.bilivideo.com"), 1, "没测过的节点各拿一块去试，总数不超过四分之一");
+  assert.notEqual(assignment[0], assignment[1], "同一节点的块不挤在一起");
+  const warm = assignPieces(pool, { hosts: {} }, 8);
+  assert.deepEqual(warm, ["fast.bilivideo.com", "mid.bilivideo.com", "slow.bilivideo.com", "crawl.bilivideo.com", "new.bilivideo.com", "fast.bilivideo.com", "mid.bilivideo.com", "slow.bilivideo.com"]);
+  const twoOnly = assignPieces(["a.bilivideo.com", "b.bilivideo.com"], { hosts: { "a.bilivideo.com": { bps: 100, measuredAt: now }, "b.bilivideo.com": { bps: 1, measuredAt: now } } }, 4);
+  assert.equal(twoOnly.length, 4);
+  assert.ok(twoOnly.includes("b.bilivideo.com"), "只剩两个可用时不排除慢的那个");
 });
 
 test("构建产物带有原作署名，且与 package.json 版本一致", () => {

@@ -1,5 +1,5 @@
 /*!
- * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.7
+ * Bilibili 线程撕裂者 · 移动端（Shadowrocket 脚本） v0.1.8
  * https://github.com/vic233333/Bilibili-thread-ripper-mobile
  *
  * 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT）
@@ -11,7 +11,7 @@
  */
 (function () {
 "use strict";
-const BTR = { VERSION: "0.1.7" };
+const BTR = { VERSION: "0.1.8" };
 
 /* src/core.js */
 // 纯逻辑，不碰任何 Shadowrocket API。CDN 主机列表、Range 解析、区间切分和设置项的规则
@@ -579,6 +579,58 @@ const BTR = { VERSION: "0.1.7" };
     };
   }
 
+  // 每块先发给哪个节点。测过速度的节点按速度分份额：快的多拿，不到最快节点八分之一的不拿
+  // （只要还剩两个可用的）；没测过的节点每段最多拿四分之一的块去试。测过的不到两个时还在热身，
+  // 轮着撒。移植自上游“最快的节点拿最多的块”的思路。
+  function assignPieces(pool, health, count) {
+    const now = Date.now();
+    const entries = pool.map(function (host) { return { host, record: health.hosts[host] || null }; });
+    const measured = entries.filter(function (entry) { return isMeasured(entry.record, now); })
+      .sort(function (a, b) { return (b.record.bps || 0) - (a.record.bps || 0); });
+    const fresh = entries.filter(function (entry) { return !isMeasured(entry.record, now); });
+    const assignment = [];
+    if (measured.length < 2 || !pool.length) {
+      for (let index = 0; index < count; index += 1) assignment.push(pool[index % pool.length]);
+      return assignment;
+    }
+    const best = measured[0].record.bps;
+    let usable = measured.filter(function (entry) { return entry.record.bps >= best / 8; });
+    if (usable.length < 2) usable = measured.slice(0, 2);
+    const trials = Math.min(fresh.length, Math.floor(count / 4));
+    const shares = Math.max(usable.length, count - trials);
+    const total = usable.reduce(function (sum, entry) { return sum + entry.record.bps; }, 0);
+    // 按速度分份额，先取整，再把余下的按小数部分从大到小补上；每个可用节点至少一块。
+    const quota = usable.map(function (entry) {
+      const exact = shares * entry.record.bps / total;
+      return { entry, whole: Math.max(1, Math.floor(exact)), fraction: exact - Math.floor(exact) };
+    });
+    let assigned = quota.reduce(function (sum, item) { return sum + item.whole; }, 0);
+    quota.sort(function (a, b) { return b.fraction - a.fraction; });
+    for (let index = 0; assigned < shares; index = (index + 1) % quota.length) { quota[index].whole += 1; assigned += 1; }
+    while (assigned > shares) {
+      const victim = quota.slice().sort(function (a, b) { return a.entry.record.bps - b.entry.record.bps; }).find(function (item) { return item.whole > 1; });
+      if (!victim) break;
+      victim.whole -= 1;
+      assigned -= 1;
+    }
+    // 交错发出：每一轮从份额最多的节点开始各拿一块，同一节点的块不会挤在一起。
+    const remaining = quota.slice().sort(function (a, b) { return b.whole - a.whole; });
+    while (assignment.length < shares) {
+      let progressed = false;
+      for (let index = 0; index < remaining.length && assignment.length < shares; index += 1) {
+        if (remaining[index].whole > 0) {
+          assignment.push(remaining[index].entry.host);
+          remaining[index].whole -= 1;
+          progressed = true;
+        }
+      }
+      if (!progressed) break;
+    }
+    for (let index = 0; index < trials && assignment.length < count; index += 1) assignment.push(fresh[index].host);
+    while (assignment.length < count) assignment.push(usable[assignment.length % usable.length].host);
+    return assignment.slice(0, count);
+  }
+
   async function fetchPiece(url, piece, headers, timeoutSec) {
     const startedAt = Date.now();
     const requestHeaders = {};
@@ -626,7 +678,9 @@ const BTR = { VERSION: "0.1.7" };
   // 一块的下载：按节点顺序发请求，失败就换下一个；一份迟迟不回来时再开一份副本。
   // $httpClient 没法取消，输掉的副本会在后台跑完，它的结果只用来更新节点速度。
   function downloadPiece(piece, plan) {
-    const order = rotate(plan.pool, piece.index);
+    // 第一选择是按速度分到的节点，之后按速度顺序换别的节点；退避中的排最后。
+    const first = plan.assignment[piece.index] || plan.pool[piece.index % plan.pool.length];
+    const order = [first].concat(rotate(plan.pool, piece.index).filter(function (host) { return host !== first; }));
     plan.all.forEach(function (host) { if (order.indexOf(host) < 0) order.push(host); });
     const queue = [];
     for (let round = 0; round < RETRY_ROUNDS; round += 1) order.forEach(function (host) { queue.push({ host, round }); });
@@ -679,11 +733,13 @@ const BTR = { VERSION: "0.1.7" };
         const host = nextHost();
         if (!host) { giveUp(lastError || env.makeError("NoHosts", "没有可用的 CDN 节点")); return; }
         running += 1;
+        plan.inflight += 1;
         plan.attempts += 1;
         if (isHedge) plan.hedges += 1;
         const url = core.buildUrl(plan.parts, { host, port: "", scheme: plan.scheme });
         fetchPiece(url, piece, plan.headers, Math.min(plan.settings.attemptTimeoutSec, remainingSec)).then(function (result) {
           running -= 1;
+          plan.inflight -= 1;
           markSuccess(plan.health, host, result.bytes.byteLength, result.elapsedMs);
           env.log("debug", "块 " + piece.index + " " + host.split(".")[0] + " " + Math.round(result.bytes.byteLength / 1024) + "KiB " + result.elapsedMs + "ms " + Math.round(result.bytes.byteLength / result.elapsedMs) + "KB/s" + (settled ? "（副本落败）" : ""));
           if (settled) return;
@@ -693,6 +749,7 @@ const BTR = { VERSION: "0.1.7" };
           finish(true, result);
         }, function (error) {
           running -= 1;
+          plan.inflight -= 1;
           if (!error || HOST_ERRORS.indexOf(error.name) < 0) {
             plan.aborted = true;
             finish(false, error || env.makeError("ScriptError", "未知错误"));
@@ -710,7 +767,10 @@ const BTR = { VERSION: "0.1.7" };
         if (settled || !env.api.setTimeout || running >= plan.hedgeMax) return;
         timer = env.api.setTimeout(function () {
           timer = null;
-          if (!settled && running < plan.hedgeMax) launch(true);
+          // 整段同时在途的请求有上限，满了就不开副本，改为再等一个周期。
+          if (settled || running >= plan.hedgeMax) return;
+          if (plan.inflight >= plan.maxInflight) { scheduleHedge(); return; }
+          launch(true);
         }, hedgeDelayMs(plan, piece));
       }
       launch(false);
@@ -733,17 +793,22 @@ const BTR = { VERSION: "0.1.7" };
       health: context.health,
       pool: ordered.pool,
       all: ordered.all,
+      assignment: assignPieces(ordered.pool, context.health, pieces.length),
       deadlineAt: startedAt + settings.deadlineSec * 1000,
       usage: {},
       attempts: 0,
       hedges: 0,
       pieceMs: [],
       attemptBudget: pieces.length * 3,
-      // 每块最多同时几份副本。脚本环境一次最多约 20 个并发请求，线程多时就不开副本。
-      hedgeMax: settings.threads <= 10 ? 2 : 1,
+      // 每块最多两份副本；整段同时在途最多 16 个请求（脚本环境的上限约 20）。
+      hedgeMax: 2,
+      inflight: 0,
+      maxInflight: 16,
       aborted: false
     };
-    env.log("debug", "拆成 " + pieces.length + " 块，节点池", plan.pool);
+    const tally = {};
+    plan.assignment.forEach(function (host) { tally[host.split(".")[0]] = (tally[host.split(".")[0]] || 0) + 1; });
+    env.log("debug", "拆成 " + pieces.length + " 块，分配", tally);
     let results;
     try {
       results = await Promise.all(pieces.map(function (piece) { return downloadPiece(piece, plan); }));
@@ -799,6 +864,7 @@ const BTR = { VERSION: "0.1.7" };
 
   BTR.accelerator = Object.freeze({
     HEALTH_KEY,
+    assignPieces,
     downloadRange,
     fetchPiece,
     loadHealth,
@@ -1162,6 +1228,7 @@ const BTR = { VERSION: "0.1.7" };
       + "td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}td.host{white-space:nowrap}td.err{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}abbr{text-decoration:none}"
       + "code{font:12px ui-monospace,Menlo,monospace;background:#f1f2f3;padding:1px 4px;border-radius:4px}"
       + ".copied{color:#0c6b3b;font-size:13px;margin-left:8px}"
+      + ".copybox{width:100%;box-sizing:border-box;height:140px;margin-top:6px;font:11px/1.4 ui-monospace,Menlo,monospace;padding:8px;border:1px solid #d0d3d9;border-radius:8px;background:#fafbfc;-webkit-user-select:text;user-select:text}summary{cursor:pointer}"
       + ".notice{background:#e6f7ee;color:#0c6b3b;border-radius:10px;padding:10px 14px;margin:12px 0}.warn{background:#fff3e0;color:#8a4b00;border-radius:10px;padding:10px 14px;margin:12px 0}"
       + ".kv{display:grid;grid-template-columns:1fr 1fr;gap:8px}.kv div{background:#f7f8fa;border-radius:10px;padding:10px}.kv b{display:block;font-size:20px}.kv small{color:#61666d}"
       + ".badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#e3e5e7}.badge.on{background:#fb7299;color:#fff}"
@@ -1214,14 +1281,18 @@ const BTR = { VERSION: "0.1.7" };
       + (recentRows ? "<div class=scroll><table><tr><th>时间</th><th></th><th>原节点</th><th>Range</th><th>结果</th><th>耗时</th></tr>" + recentRows + "</table></div>" : "<div class=sub>暂无。打开 B 站 App 播放一个视频，再刷新这个页面。</div>")
       + "</div>"
       + "<div class=card><h2 style=\"margin-top:0\">复制</h2>"
-      + "<div class=sub>点一下就复制到剪贴板，直接粘贴给别人看。都不含签名地址和 Cookie。</div>"
+      + "<div class=sub>点按钮复制到剪贴板。这个页面是 http，iOS 有时不允许网页写剪贴板；那时按钮会把下面文本框里的内容全选好，再点系统弹出的「拷贝」即可。都不含签名地址和 Cookie。</div>"
       + "<button type=button data-copy=log>复制日志</button>"
       + "<button type=button data-copy=diag>复制诊断 JSON</button><span class=copied id=copied></span>"
-      + "<textarea id=copy-log readonly style=\"position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0\">" + escapeHtml(logText) + "</textarea>"
-      + "<textarea id=copy-diag readonly style=\"position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0\">" + escapeHtml(diagText) + "</textarea>"
-      + "<script>(function(){var tip=document.getElementById('copied');function copyFrom(id){var ta=document.getElementById(id);var text=ta.value;if(navigator.clipboard&&window.isSecureContext){return navigator.clipboard.writeText(text).then(function(){return true;},function(){return legacy(ta);});}return Promise.resolve(legacy(ta));}"
-      + "function legacy(ta){var ok=false;try{ta.readOnly=false;ta.contentEditable='true';var range=document.createRange();range.selectNodeContents(ta);var sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);ta.setSelectionRange(0,ta.value.length);ok=document.execCommand('copy');}catch(e){ok=false;}try{ta.readOnly=true;ta.contentEditable='false';window.getSelection().removeAllRanges();}catch(e){}return ok;}"
-      + "[].forEach.call(document.querySelectorAll('button[data-copy]'),function(btn){btn.addEventListener('click',function(){copyFrom('copy-'+btn.getAttribute('data-copy')).then(function(ok){tip.textContent=ok?'已复制':'复制失败，请打开 /log.txt 手动全选';setTimeout(function(){tip.textContent='';},2500);});});});})();</script>"
+      + "<details id=box-log style=\"margin-top:10px\"><summary class=sub>日志文本（" + loadLog().length + " 行）</summary><textarea id=copy-log class=copybox readonly>" + escapeHtml(logText) + "</textarea></details>"
+      + "<details id=box-diag style=\"margin-top:6px\"><summary class=sub>诊断 JSON 文本</summary><textarea id=copy-diag class=copybox readonly>" + escapeHtml(diagText) + "</textarea></details>"
+      + "<script>(function(){var tip=document.getElementById('copied');"
+      + "function selectAll(ta){ta.readOnly=false;ta.contentEditable='true';ta.focus();var range=document.createRange();range.selectNodeContents(ta);var sel=window.getSelection();sel.removeAllRanges();sel.addRange(range);ta.setSelectionRange(0,ta.value.length);}"
+      + "function restore(ta){ta.readOnly=true;ta.contentEditable='false';}"
+      + "function attempt(kind){var ta=document.getElementById('copy-'+kind);var box=document.getElementById('box-'+kind);box.open=true;var ok=false;try{selectAll(ta);ok=document.execCommand('copy');}catch(e){ok=false;}"
+      + "if(ok){restore(ta);try{window.getSelection().removeAllRanges();}catch(e){}tip.textContent='已复制';setTimeout(function(){tip.textContent='';},2500);}"
+      + "else{tip.textContent='已全选，请点系统弹出的「拷贝」';setTimeout(function(){restore(ta);tip.textContent='';},8000);}}"
+      + "[].forEach.call(document.querySelectorAll('button[data-copy]'),function(btn){btn.addEventListener('click',function(){attempt(btn.getAttribute('data-copy'));});});})();</script>"
       + "</div>"
       + "<div class=card><h2 style=\"margin-top:0\">操作</h2>"
       + "<a class=\"btn secondary\" href=\"/reset?what=stats\">清空统计</a>"
