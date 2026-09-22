@@ -1,0 +1,170 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { createEnv, createStore, loadModules } = require("./harness");
+
+const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
+
+function page(pathname) {
+  return { url: `http://btr.settings${pathname}`, method: "GET", headers: { Host: "btr.settings", "User-Agent": "Safari" } };
+}
+
+test("设置页能打开，显示版本和默认设置", async () => {
+  const env = createEnv({ server: null });
+  const { value } = await env.run(page("/"));
+  assert.equal(value.response.status, 200);
+  assert.match(value.response.headers["Content-Type"], /text\/html/);
+  assert.ok(value.response.body.includes(pkg.version));
+  assert.ok(value.response.body.includes("已启用"));
+  assert.ok(value.response.body.includes("<option value=mainland selected>"));
+  assert.ok(value.response.body.includes("upos-sz-mirrorali.bilivideo.com"));
+  assert.equal(env.store.json("btr.stats"), null, "设置页自己不算进统计");
+});
+
+test("保存表单后设置写进存储，页面回显新值", async () => {
+  const env = createEnv({ server: null });
+  const query = "enabled=1&mode=custom&customHosts=upos-sz-mirrorcos.bilivideo.com%0Aupos-sz-mirrorali.bilivideo.com%2C+bad+host&threads=4&maxMiB=12&minChunkKiB=512&subrequestScheme=https&attemptTimeoutSec=6&deadlineSec=25&debug=1";
+  const { value } = await env.run(page(`/save?${query}`));
+  assert.equal(value.response.status, 200);
+  assert.ok(value.response.body.includes("设置已保存"));
+  const saved = env.store.json("btr.settings");
+  assert.deepEqual(saved, {
+    enabled: true,
+    accelerate: "split",
+    mode: "custom",
+    customHosts: ["upos-sz-mirrorcos.bilivideo.com", "upos-sz-mirrorali.bilivideo.com"],
+    threads: 4,
+    maxMiB: 12,
+    minChunkKiB: 512,
+    swapSingle: false,
+    subrequestScheme: "https",
+    attemptTimeoutSec: 6,
+    deadlineSec: 25,
+    debug: true
+  });
+  assert.ok(value.response.body.includes("<option value=4 selected>"));
+  assert.ok(value.response.body.includes("<option value=custom selected>"));
+});
+
+test("越界的值会被拉回范围，缺失的复选框当作关闭", async () => {
+  const env = createEnv({ server: null });
+  await env.run(page("/save?mode=nonsense&threads=999&maxMiB=999&minChunkKiB=1&attemptTimeoutSec=0&deadlineSec=1000"));
+  const saved = env.store.json("btr.settings");
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.mode, "mainland");
+  assert.equal(saved.threads, 8);
+  assert.equal(saved.maxMiB, 24);
+  assert.equal(saved.minChunkKiB, 64);
+  assert.equal(saved.attemptTimeoutSec, 3);
+  assert.equal(saved.deadlineSec, 40);
+  assert.equal(saved.swapSingle, false);
+});
+
+test("重置统计、节点记忆和环境标记", async () => {
+  const store = createStore();
+  store.setJson("btr.stats", { since: 1, seen: 9, accelerated: 3, rewritten: 1, passthrough: { noRange: 5 }, bytes: 10, elapsedMs: 10, recent: [] });
+  store.setJson("btr.health", { hosts: { "upos-sz-mirrorali.bilivideo.com": { bps: 1, okAt: Date.now() } } });
+  store.setJson("btr.env", { binaryUnsupported: true });
+  const env = createEnv({ server: null, store });
+  const { value } = await env.run(page("/reset?what=all"));
+  assert.ok(value.response.body.includes("已重置"));
+  assert.equal(store.json("btr.stats").seen, 0);
+  assert.deepEqual(store.json("btr.health"), { hosts: {} });
+  assert.deepEqual(store.json("btr.env"), {});
+});
+
+test("诊断 JSON 包含版本、能力、设置和统计", async () => {
+  const env = createEnv({ server: null });
+  const { value } = await env.run(page("/diag.json"));
+  const diag = JSON.parse(value.response.body);
+  assert.equal(diag.version, pkg.version);
+  assert.equal(diag.capabilities.httpClient, true);
+  assert.equal(diag.capabilities.persistentStore, true);
+  assert.equal(diag.settings.threads, 8);
+  assert.equal(diag.settings.maxBytes, 8 * 1024 * 1024);
+});
+
+test("不存在的页面返回 404", async () => {
+  const env = createEnv({ server: null });
+  const { value } = await env.run(page("/nothing"));
+  assert.equal(value.response.status, 404);
+});
+
+test("core 里的解析规则", async () => {
+  const BTR = await loadModules();
+  const { core } = BTR;
+  assert.deepEqual(core.parseRangeHeader("bytes=0-99"), { kind: "bounded", raw: "bytes=0-99", start: 0, end: 99, length: 100 });
+  assert.equal(core.parseRangeHeader("bytes=5-").kind, "open");
+  assert.equal(core.parseRangeHeader("bytes=-500").kind, "suffix");
+  assert.equal(core.parseRangeHeader("bytes=0-1,5-9").kind, "multi");
+  assert.equal(core.parseRangeHeader("bytes=9-5").kind, "invalid");
+  assert.equal(core.parseRangeHeader(undefined).kind, "none");
+  assert.deepEqual(core.parseContentRange("bytes 10-19/100"), { start: 10, end: 19, total: 100, length: 10 });
+  assert.equal(core.parseContentRange("bytes 10-19/15"), null);
+  assert.equal(core.parseContentRange("bytes 10-19/*").total, null);
+
+  const parts = core.parseUrl("http://upos-hz-mirrorakam.akamaized.net:80/upgcxcode/a/b.m4s?x=1&y=2#frag");
+  assert.equal(parts.host, "upos-hz-mirrorakam.akamaized.net");
+  assert.equal(parts.port, "80");
+  assert.equal(parts.path, "/upgcxcode/a/b.m4s");
+  assert.equal(parts.query, "?x=1&y=2");
+  assert.equal(core.buildUrl(parts, { host: "upos-sz-mirrorali.bilivideo.com", port: "" }), "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/a/b.m4s?x=1&y=2");
+  assert.ok(core.isMediaUrl(parts) && core.isUposPath(parts));
+  assert.equal(core.isMediaUrl(core.parseUrl("http://example.com/upgcxcode/a/b.m4s")), false);
+  assert.equal(core.isUposPath(core.parseUrl("http://a.mcdn.bilivideo.cn:8000/v1/resource/b.m4s")), false);
+
+  const pieces = core.splitRange(0, 1024 * 1024 - 1, 8, 256 * 1024);
+  assert.equal(pieces.length, 4);
+  assert.equal(pieces[0].start, 0);
+  assert.equal(pieces[3].end, 1024 * 1024 - 1);
+  assert.equal(pieces.reduce((sum, piece) => sum + piece.length, 0), 1024 * 1024);
+  assert.equal(core.splitRange(0, 99, 8, 256 * 1024).length, 1);
+
+  assert.equal(core.normalizeCdnHost("HTTPS://upos-sz-mirrorali.bilivideo.com/path"), "upos-sz-mirrorali.bilivideo.com");
+  assert.equal(core.normalizeCdnHost("cn-hk-eq-01-01.bilivideo.com:443"), "cn-hk-eq-01-01.bilivideo.com");
+  assert.equal(core.normalizeCdnHost("evil.example.com"), "");
+  assert.equal(core.mediaKind("/upgcxcode/1/2/3/3-1-30280.m4s"), "audio");
+  assert.equal(core.mediaKind("/upgcxcode/1/2/3/3-1-30080.m4s"), "video");
+  assert.equal(core.mediaKind("/upgcxcode/1/2/3/3-1-100026.m4s"), "video");
+  assert.equal(core.mediaKind("/foo.m4s"), "unknown");
+
+  const mainland = core.normalizeSettings({});
+  assert.deepEqual(core.candidateHosts("upos-hz-mirrorakam.akamaized.net", mainland), [...core.MAINLAND_HOSTS]);
+  assert.deepEqual(core.candidateHosts("upos-sz-mirrorcos.bilivideo.com", mainland)[0], "upos-sz-mirrorcos.bilivideo.com");
+  const overseas = core.normalizeSettings({ mode: "overseas" });
+  assert.deepEqual(core.candidateHosts("upos-hz-mirrorakam.akamaized.net", overseas), ["upos-hz-mirrorakam.akamaized.net", ...core.OVERSEAS_HOSTS]);
+  assert.deepEqual(core.candidateHosts("upos-sz-mirrorali.bilivideo.com", overseas), [...core.OVERSEAS_HOSTS]);
+});
+
+test("节点排序：热身时撒到所有节点，测过速度后按快慢并保留一个探路名额，退避的排最后", async () => {
+  const BTR = await loadModules();
+  const { accelerator } = BTR;
+  const now = Date.now();
+  const hosts = ["a.bilivideo.com", "b.bilivideo.com", "c.bilivideo.com", "d.bilivideo.com"];
+  const warm = accelerator.orderCandidates(hosts, { hosts: { "a.bilivideo.com": { bps: 100, measuredAt: now } } }, 8);
+  assert.deepEqual(warm.pool, hosts, "只有一个测过时仍在热身");
+  const measured = accelerator.orderCandidates(hosts, { hosts: {
+    "a.bilivideo.com": { bps: 100, measuredAt: now },
+    "b.bilivideo.com": { bps: 300, measuredAt: now },
+    "c.bilivideo.com": { bps: 999, measuredAt: now - 10 * 60 * 1000 },
+    "d.bilivideo.com": { blockedUntil: now + 5000, fails: 1 }
+  } }, 8);
+  assert.deepEqual(measured.pool, ["b.bilivideo.com", "a.bilivideo.com", "c.bilivideo.com"], "快的在前，过期的 c 当探路");
+  assert.deepEqual(measured.all, ["b.bilivideo.com", "a.bilivideo.com", "c.bilivideo.com", "d.bilivideo.com"]);
+  const allBlocked = accelerator.orderCandidates(hosts.slice(0, 2), { hosts: {
+    "a.bilivideo.com": { blockedUntil: now + 9000 },
+    "b.bilivideo.com": { blockedUntil: now + 1000 }
+  } }, 8);
+  assert.deepEqual(allBlocked.pool, ["b.bilivideo.com", "a.bilivideo.com"], "全在退避时先试最早解禁的");
+});
+
+test("构建产物带有原作署名，且与 package.json 版本一致", () => {
+  const bundle = fs.readFileSync(path.resolve(__dirname, "..", "shadowrocket", "bilibili-thread-ripper.js"), "utf8");
+  assert.ok(bundle.startsWith("/*!"));
+  assert.ok(bundle.includes("MrTangLuyao/Bilibili-thread-ripper"));
+  assert.ok(bundle.includes(`const BTR = { VERSION: "${pkg.version}" };`));
+  assert.ok(!/\$request\s*=/.test(bundle.replace(/typeof \$request/g, "")), "不要给环境变量赋值");
+});

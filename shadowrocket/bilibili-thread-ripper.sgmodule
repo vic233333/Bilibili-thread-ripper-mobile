@@ -1,0 +1,21 @@
+#!name=Bilibili 线程撕裂者（移动端）
+#!desc=给 B 站官方 App 加速：把每个视频分片请求拆成多块，向多个 CDN 节点并发下载后拼好交还播放器。不需要 HTTPS 解密。设置页：http://btr.settings/
+#!author=vic233333
+#!homepage=https://github.com/vic233333/Bilibili-thread-ripper-mobile
+#!icon=https://raw.githubusercontent.com/MrTangLuyao/Bilibili-thread-ripper/main/icons/icon-128.png
+#!category=B 站
+#!system=ios
+
+# 原作：MrTangLuyao 的 Bilibili 线程撕裂者（MIT） https://github.com/MrTangLuyao/Bilibili-thread-ripper
+# 这个模块只处理明文 http 的视频分片，也就是 B 站 App 实际下载视频的请求；HTTPS 的接口请求一律不碰。
+
+[Script]
+# 视频与音频分片：只匹配可以整体换节点的 /upgcxcode/ 路径。PCDN（/v1/resource/）不在此列。
+btr-media = type=http-request, pattern=^http:\/\/[^\/]+\.(?:bilivideo\.(?:com|cn|net)|akamaized\.net)(?::\d+)?\/upgcxcode\/.+\.(?:m4s|mp4|flv)(?:\?.*)?$, requires-body=0, timeout=45, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js
+
+# 设置页与统计：在 Safari 里打开 http://btr.settings/
+btr-settings = type=http-request, pattern=^http:\/\/btr\.settings(?:\/.*)?$, requires-body=0, timeout=10, engine=webview, script-path=https://raw.githubusercontent.com/vic233333/Bilibili-thread-ripper-mobile/main/shadowrocket/bilibili-thread-ripper.js
+
+[Host]
+# btr.settings 不是真实域名，指到本机让请求能发出来；请求在发出前就被上面的脚本接住了。
+btr.settings = 127.0.0.1
